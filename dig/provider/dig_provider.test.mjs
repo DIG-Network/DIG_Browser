@@ -1,19 +1,26 @@
 // Test harness for the injected window.chia provider (dig/provider/dig_provider.js).
 //
-// A full Chromium build is infeasible in CI for an introspection/agent-surface
-// change, so this loads the IIFE provider source directly under a synthetic
-// `window` and asserts the self-describing surface an agent relies on:
-//   - window.chia.version / .info (provider identity)
-//   - window.chia.methods (the static method catalogue)
-//   - request({method:'chip0002_getMethods'}) (the introspection RPC, answered
-//     locally without touching the native bridge)
-//   - the stable thrown-error codes (4001/4100/4200 + provider transport codes)
+// A full Chromium build is infeasible in CI for a provider-surface change, so this
+// loads the GENERATED IIFE provider source directly under a synthetic `window`
+// and asserts the full shared-package surface an agent/dapp relies on.
 //
-// The provider is the single source of truth (compiled verbatim into the
-// renderer by build.py); this harness EXECUTES that exact file so the test can
-// never drift from the shipped provider.
+// dig_provider.js is BUNDLED from @dignetwork/chia-provider's buildProvider() by
+// build-provider.mjs (entry: dig_provider.entry.mjs), wrapped with the browser's
+// NATIVE window.__digWalletRpc transport. This harness EXECUTES that exact
+// generated file so the test can never drift from what build.py embeds into the
+// renderer. Regenerate the provider (npm run build) before running this if the
+// entry or the package changed.
 //
-// Run:  node dig/provider/dig_provider.test.mjs
+// It asserts:
+//   - identity: isDIG, isGoby, version, info{transport:native,edition:browser,scheme:chia}
+//   - the static method catalogue (window.chia.methods, all namespaced, no dups)
+//   - request({method:'chip0002_getMethods'|'getMethods'}) answered locally (no bridge)
+//   - the shared error codes (USER_REJECTED/UNAUTHORIZED/UNSUPPORTED_METHOD/DISCONNECTED)
+//   - transport error mapping: unreachable→4900, 401→4100, 202→4001+pending
+//   - Goby parity: isConnected() callable, direct methods, transfer→chia_send remap,
+//     requestAccounts/accounts, walletSwitchChain mainnet-only, the 202→200 retry loop
+//
+// Run:  node --test dig/provider/dig_provider.test.mjs
 // (Node >= 18; uses the built-in `node:test` runner + `node:assert`.)
 
 import { test } from 'node:test';
@@ -34,7 +41,9 @@ function sameJson(a, b) {
 }
 
 // Load the provider IIFE into a sandbox with a synthetic window. `bridge`, when
-// provided, becomes window.__digWalletRpc (the native Mojo pipe stand-in).
+// provided, becomes window.__digWalletRpc (the native Mojo pipe stand-in). The
+// bundled package uses setTimeout for connect's backoff, JSON, Date, Promise —
+// all provided here so the realm mirrors a real renderer main world.
 function loadProvider(bridge) {
   const events = [];
   const sandbox = {
@@ -43,8 +52,11 @@ function loadProvider(bridge) {
     },
     Event: class { constructor(type) { this.type = type; } },
     setTimeout,
+    clearTimeout,
     Date,
     Promise,
+    JSON,
+    console,
   };
   if (bridge) sandbox.window.__digWalletRpc = bridge;
   sandbox.window.window = sandbox.window;
@@ -53,9 +65,27 @@ function loadProvider(bridge) {
   return { chia: sandbox.window.chia, events };
 }
 
-test('provider exposes a stable identity: isDIG + version + info', () => {
+// A native-bridge stand-in that records the JSON requests it received and answers
+// per method with canned data. Mirrors window.__digWalletRpc.request(json, cb).
+function spyBridge() {
+  const reqs = [];
+  const bridge = {
+    request(reqJson, cb) {
+      const parsed = JSON.parse(reqJson);
+      reqs.push(parsed);
+      if (parsed.method === 'chia_getAddress') { cb(JSON.stringify({ status: 200, body: { data: { address: 'xch1testaddr' } } })); return; }
+      if (parsed.method === 'chia_send') { cb(JSON.stringify({ status: 200, body: { data: { id: '0xspend' } } })); return; }
+      if (parsed.method === 'chip0002_connect') { cb(JSON.stringify({ status: 200, body: { data: { connected: true } } })); return; }
+      cb(JSON.stringify({ status: 200, body: { data: {} } }));
+    },
+  };
+  return { reqs, bridge };
+}
+
+test('provider exposes a stable identity: isDIG + isGoby + version + info', () => {
   const { chia } = loadProvider();
   assert.equal(chia.isDIG, true);
+  assert.equal(chia.isGoby, true, 'browser provider must advertise isGoby for Goby dApps');
   assert.equal(typeof chia.version, 'string');
   assert.ok(chia.version.length > 0, 'version is a non-empty string');
   assert.ok(chia.info && typeof chia.info === 'object', 'info object present');
@@ -89,24 +119,25 @@ test('chip0002_getMethods is answered locally (no bridge call) and returns the c
   };
   const { chia } = loadProvider(bridge);
   const res = await chia.request({ method: 'chip0002_getMethods' });
-  assert.deepEqual(res, chia.methods);
+  sameJson(res, chia.methods);
   // The bare form resolves to the same introspection answer.
   const res2 = await chia.request({ method: 'getMethods' });
-  assert.deepEqual(res2, chia.methods);
+  sameJson(res2, chia.methods);
   assert.equal(bridgeCalls, 0, 'introspection must not hit the native bridge');
 });
 
-test('errorCodes catalogue is exported and uses standard wallet codes', () => {
+test('errorCodes catalogue is exported and uses the shared package codes', () => {
   const { chia } = loadProvider();
   assert.ok(chia.errorCodes && typeof chia.errorCodes === 'object');
   assert.equal(chia.errorCodes.USER_REJECTED, 4001);
   assert.equal(chia.errorCodes.UNAUTHORIZED, 4100);
   assert.equal(chia.errorCodes.UNSUPPORTED_METHOD, 4200);
-  assert.equal(chia.errorCodes.WALLET_UNREACHABLE, 4900);
+  // Shared-package name is DISCONNECTED (was WALLET_UNREACHABLE in the old fork).
+  assert.equal(chia.errorCodes.DISCONNECTED, 4900);
 });
 
-test('an unreachable bridge throws WALLET_UNREACHABLE (4900), not the ad-hoc -1', async () => {
-  // No bridge installed at all.
+test('an unreachable bridge throws DISCONNECTED (4900), not the ad-hoc -1', async () => {
+  // No bridge installed at all → bridgeCall resolves null → package maps to 4900.
   const { chia } = loadProvider();
   await assert.rejects(
     () => chia.request({ method: 'getPublicKeys' }),
@@ -125,7 +156,7 @@ test('a 401 from the wallet maps to UNAUTHORIZED (4100)', async () => {
     (e) => { assert.equal(e.code, 4100); return true; });
 });
 
-test('a pending (202) connect surfaces USER_REJECTED-class pending code (4001)', async () => {
+test('a pending (202) surfaces USER_REJECTED-class pending code (4001)', async () => {
   const bridge = {
     request(_req, cb) { cb(JSON.stringify({ status: 202, body: {} })); },
   };
@@ -136,7 +167,7 @@ test('a pending (202) connect surfaces USER_REJECTED-class pending code (4001)',
     (e) => { assert.equal(e.code, 4001); assert.equal(e.pending, true); return true; });
 });
 
-test('a successful call returns body.data and marks connected on connect', async () => {
+test('a successful call returns body.data and isConnected() flips true on connect', async () => {
   const bridge = {
     request(req, cb) {
       const parsed = JSON.parse(req);
@@ -150,6 +181,118 @@ test('a successful call returns body.data and marks connected on connect', async
   const { chia } = loadProvider(bridge);
   const keys = await chia.request({ method: 'getPublicKeys' });
   sameJson(keys, ['pk1', 'pk2']);
+  // isConnected() is a CALLABLE (Goby convention), not a boolean property.
+  assert.equal(typeof chia.isConnected, 'function');
+  assert.equal(chia.isConnected(), false);
   await chia.connect();
-  assert.equal(chia.isConnected, true);
+  assert.equal(chia.isConnected(), true);
+  assert.equal(chia.chainId, 'mainnet'); // DIG is Chia mainnet
+});
+
+// ─── Goby / CHIP-0002 / Sage-WC2 compatibility (shared-package parity) ──────────
+// These pin the surface the browser gained by consuming @dignetwork/chia-provider:
+// identity flags, Goby-legacy DIRECT methods on the object, alias routing, the
+// account helpers, mainnet-only chain switch, and isConnected() as a callable.
+
+test('Goby-legacy direct methods exist on the provider object', () => {
+  const { bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  for (const m of [
+    'connect', 'getPublicKeys', 'filterUnlockedCoins', 'getAssetCoins', 'getAssetBalance',
+    'signCoinSpends', 'signMessage', 'signMessageByAddress', 'transfer', 'sendTransaction',
+    'createOffer', 'takeOffer', 'cancelOffer', 'getNFTs', 'getNFTInfo', 'walletSwitchChain',
+    'walletWatchAsset', 'requestAccounts', 'accounts',
+  ]) {
+    assert.equal(typeof chia[m], 'function', `${m} is a direct method`);
+  }
+});
+
+test('request({method:"transfer"}) routes to chia_send with to→address remap', async () => {
+  const { reqs, bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  await chia.request({ method: 'transfer', params: { to: 'xch1dest', amount: 7, fee: 1 } });
+  const sent = reqs.find((r) => r.method === 'chia_send');
+  assert.ok(sent, 'transfer must reach the native bridge as chia_send');
+  sameJson(sent.params, { amount: 7, fee: 1, address: 'xch1dest' });
+});
+
+test('the direct transfer() method routes identically to request', async () => {
+  const { reqs, bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  await chia.transfer({ to: 'xch1dest2', amount: 3 });
+  const sent = reqs.find((r) => r.method === 'chia_send');
+  assert.ok(sent);
+  sameJson(sent.params, { amount: 3, address: 'xch1dest2' });
+});
+
+test('request({method:"getPublicKeys"}) routes to chip0002_getPublicKeys', async () => {
+  const { reqs, bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  await chia.request({ method: 'getPublicKeys' });
+  assert.ok(reqs.some((r) => r.method === 'chip0002_getPublicKeys'));
+});
+
+test('requestAccounts() connects then returns the address list + caches selectedAddress', async () => {
+  const { bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  const accts = await chia.requestAccounts();
+  sameJson(accts, ['xch1testaddr']);
+  assert.equal(chia.isConnected(), true);
+  assert.equal(chia.selectedAddress, 'xch1testaddr');
+});
+
+test('accounts() rejects 4900 when not connected, returns addresses once connected', async () => {
+  const { bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  await assert.rejects(() => chia.accounts(), (e) => { assert.equal(e.code, 4900); return true; });
+  await chia.connect();
+  sameJson(await chia.accounts(), ['xch1testaddr']);
+});
+
+test('walletSwitchChain accepts mainnet locally and rejects other chains as unsupported', async () => {
+  const { reqs, bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  assert.equal(await chia.walletSwitchChain({ chainId: 'mainnet' }), null);
+  assert.equal(reqs.length, 0, 'mainnet switch is answered locally, no bridge call');
+  await assert.rejects(
+    () => chia.walletSwitchChain({ chainId: 'testnet11' }),
+    (e) => { assert.equal(e.code, 4200); return true; });
+});
+
+test('connect() polls through 202 pending-approval responses then resolves', async () => {
+  // The package's connect() backoff calls setTimeout(res, 1200). Patch the sandbox
+  // to fire on the next macrotask so the retry loop advances fast + deterministically.
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, _ms, ...args) => realSetTimeout(fn, 0, ...args);
+  try {
+    let attempt = 0;
+    const bridge = {
+      request(_req, cb) {
+        attempt++;
+        if (attempt < 3) { cb(JSON.stringify({ status: 202, body: {} })); return; } // pending, retry
+        cb(JSON.stringify({ status: 200, body: { data: { approved: true } } }));
+      },
+    };
+    const { chia } = loadProvider(bridge);
+    const r = await chia.connect();
+    sameJson(r, { approved: true });
+    assert.equal(attempt, 3, 'should have retried twice before approval');
+    assert.equal(chia.isConnected(), true);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+});
+
+test('on/off accept the connect event and a throwing listener is isolated', async () => {
+  const { bridge } = spyBridge();
+  const { chia } = loadProvider(bridge);
+  const seen = [];
+  const handler = (d) => seen.push(d);
+  chia.on('connect', handler);
+  chia.on('connect', () => { throw new Error('listener blew up'); });
+  await chia.connect();
+  assert.equal(seen.length, 1, 'the good listener fired despite the throwing one');
+  chia.off('connect', handler);
+  await chia.connect();
+  assert.equal(seen.length, 1, 'removed listener must not fire again');
 });

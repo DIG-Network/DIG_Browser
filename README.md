@@ -239,18 +239,27 @@ LEDGER** for the page's capsule:
 DIG Browser is self-describing so an agent or dapp can introspect it without
 out-of-band knowledge:
 
-- **Injected wallet (`window.chia`)** — a CHIP-0002 provider injected into every
-  page. It exposes its own identity and capabilities:
-  - `window.chia.isDIG` / `.version` / `.info` (`{isDIG, transport:"native",
-    edition:"browser", scheme:"chia", version}`),
+- **Injected wallet (`window.chia`)** — a Goby / CHIP-0002 / Sage-WalletConnect2
+  compatible provider injected into every page. It is **bundled from the shared
+  package [`@dignetwork/chia-provider`](https://www.npmjs.com/package/@dignetwork/chia-provider)**
+  (`buildProvider`) wrapped with the browser's native `window.__digWalletRpc`
+  transport, so the DIG Browser and the `dig-chrome-extension` expose the
+  IDENTICAL `window.chia` — one contract, two consumers, no drift. It exposes:
+  - `window.chia.isDIG` / `.isGoby` / `.name` / `.version` / `.apiVersion` /
+    `.info` (`{isDIG, transport:"native", edition:"browser", scheme:"chia",
+    providerVersion, version}`),
   - `window.chia.methods` — the supported method catalogue (also over the wire
     via `request({method:"chip0002_getMethods"})`, answered locally),
+  - the Goby-legacy DIRECT methods (`getPublicKeys()`, `transfer()`,
+    `createOffer()`, …), `requestAccounts()`/`accounts()`, `walletSwitchChain()`
+    (mainnet-only), and `isConnected()` as a CALLABLE,
   - `window.chia.errorCodes` and the documented thrown-error codes: `4001`
     user-rejected/pending, `4100` unauthorized, `4200` unsupported method, `4900`
-    wallet unreachable. The typed contract is
-    [`dig/provider/dig_provider.d.ts`](dig/provider/dig_provider.js).
-  It is byte-aligned with the `dig-chrome-extension`'s `window.chia` so a dapp
-  sees the same surface on either.
+    disconnected/unreachable. The typed contract is
+    [`dig/provider/dig_provider.d.ts`](dig/provider/dig_provider.d.ts).
+  The provider JS is regenerated with `cd dig/provider && npm install && npm run
+  build` (entry: `dig_provider.entry.mjs`); `build.py` embeds the generated
+  `dig_provider.js` into the renderer.
 - **Version** — `dig://about` shows the running build (the `{{VERSION}}` token is
   filled at request time from `version_info`; the same value is substituted into
   the provider's `window.chia.version` at build time).

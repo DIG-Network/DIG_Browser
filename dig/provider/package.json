@@ -1,0 +1,17 @@
+{
+  "name": "dig-provider-build",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Build tooling for the DIG Browser injected window.chia provider — bundles dig_provider.js from @dignetwork/chia-provider (the shared provider surface) so the browser and the dig-chrome-extension expose the identical window.chia.",
+  "scripts": {
+    "build": "node build-provider.mjs",
+    "test": "node --test dig_provider.test.mjs"
+  },
+  "dependencies": {
+    "@dignetwork/chia-provider": "^0.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
