@@ -403,27 +403,32 @@ def _make_tmp_paths():
 def _stage_dig_runtime(out_dir):
     """Build + stage the native in-process DIG runtime DLL next to the browser.
 
-    dig_runtime.dll is a cargo-built cdylib (the sibling `digstore` submodule's
-    `dig-runtime` crate). The browser loads it at startup (chrome_browser_main's
-    PostBrowserStart) and runs the DIG node — chia:// content serving +
-    chain-anchored root resolution — on its own threads INSIDE the browser
-    process, so there is NO dig-node.exe sidecar. We build it from the sibling
-    crate and copy it next to dig.exe. Best-effort: if cargo or the crate is
-    unavailable the browser still builds (chia:// just won't serve until the DLL
-    is present).
+    dig_runtime.dll is a cargo-built cdylib from the sibling `dig-node` repo (the
+    CANONICAL dig-node). Its `dig-runtime` crate links the `dig-node` node library
+    directly — the SAME node implementation the standalone OS-service binary runs —
+    so the browser process IS the DIG node. The browser loads the DLL at startup
+    (chrome_browser_main's PostBrowserStart) and runs the node — chia:// content
+    serving + chain-anchored root resolution — on its own threads INSIDE the browser
+    process, so there is NO dig-node.exe sidecar. The FFI contract (the exported C
+    symbols dig_runtime_start / dig_rpc / dig_wallet_rpc / dig_free) is unchanged by
+    the crate's move out of digstore into dig-node, so nothing in the C++/patch layer
+    changes; only this build path points at the new sibling repo.
+
+    Best-effort: if cargo or the crate is unavailable the browser still builds
+    (chia:// just won't serve until the DLL is present).
     """
-    digstore = _ROOT_DIR.parent / 'digstore'
-    if not (digstore / 'crates' / 'dig-runtime' / 'Cargo.toml').exists():
+    dig_node = _ROOT_DIR.parent / 'dig-node'
+    if not (dig_node / 'crates' / 'dig-runtime' / 'Cargo.toml').exists():
         get_logger().warning(
-            'dig-runtime crate not found at %s; skipping DIG runtime DLL', digstore)
+            'dig-runtime crate not found at %s; skipping DIG runtime DLL', dig_node)
         return
     try:
         subprocess.run(['cargo', 'build', '-p', 'dig-runtime', '--release'],
-                       cwd=str(digstore), check=True)
+                       cwd=str(dig_node), check=True)
     except Exception as exc:  # noqa: BLE001 — best-effort packaging step
         get_logger().warning('dig-runtime build failed (%s); skipping DIG runtime DLL', exc)
         return
-    dll = digstore / 'target' / 'release' / 'dig_runtime.dll'
+    dll = dig_node / 'target' / 'release' / 'dig_runtime.dll'
     if dll.exists():
         shutil.copy2(dll, out_dir / 'dig_runtime.dll')
         get_logger().info('Staged native DIG runtime DLL: %s', out_dir / 'dig_runtime.dll')

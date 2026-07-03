@@ -10,7 +10,7 @@
 // transport — additive policy only):
 //
 //   1. STAGE / COMPILE a folder → capsule `.module`  ──  `dig.stage`
-//      Served by the dig-node `handle_rpc` dispatch (digstore crates/dig-node),
+//      Served by the dig-node `handle_rpc` dispatch (dig-node crates/dig-node),
 //      which backs BOTH the in-process FFI (`dig::CallDigRpc`) AND a standalone
 //      dig-node's loopback JSON-RPC at POST "/". The My Node page already POSTs
 //      `control.*` to that loopback base, so it reaches `dig.stage` the same way.
@@ -54,7 +54,7 @@
 /** The staging/compile RPC method name, dispatched verbatim by dig-node. */
 export const STAGE_METHOD = "dig.stage";
 
-/** Catalogued dig.stage JSON-RPC error codes (digstore crates/dig-node). */
+/** Catalogued dig.stage JSON-RPC error codes (dig-node crates/dig-node). */
 export const STAGE_ERR = Object.freeze({
   INVALID_PARAMS: -32602, // missing/empty dir, malformed store_id/salt
   NOT_A_DIR: -32011, // dir is not a readable directory
@@ -65,7 +65,7 @@ export const STAGE_ERR = Object.freeze({
 
 // ---- engine contract: wallet store spends (window.chia) --------------------
 
-/** The wallet store-spend methods (digstore crates/dig-wallet, Pass B). */
+/** The wallet store-spend methods (dig-node crates/dig-wallet, Pass B). */
 export const WALLET_MINT = "chia_mintStore";
 export const WALLET_ADVANCE = "chia_advanceStore";
 
