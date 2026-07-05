@@ -4,8 +4,10 @@
 //
 // When a LOCAL standalone dig-node is present, the browser's "My Node" surface
 // (dig://node) drives the node's control.* admin RPCs — status, hosted stores
-// (list/pin/unpin), cache (view/clear/setCap), §21 sync (status/trigger), and
-// config (get/upstream). These control methods live BESIDE the node's read RPC,
+// (list/pin/unpin), §21 sync (status/trigger), and config (get/upstream). The
+// browser is NOT the node's cache-config UI (#44 SoC): cache management lives on
+// the node's own control surface, so the browser surfaces no cache.* control.
+// These control methods live BESIDE the node's read RPC,
 // are loopback-only, and are gated by a local control token:
 //   - the node writes a 64-hex token to <config_dir>/control-token,
 //   - every control.* call must carry it in the X-Dig-Control-Token header
@@ -54,9 +56,6 @@ export const CONTROL_METHODS = Object.freeze({
   status: "control.status",
   configGet: "control.config.get",
   configSetUpstream: "control.config.setUpstream",
-  cacheGet: "control.cache.get",
-  cacheSetCap: "control.cache.setCap",
-  cacheClear: "control.cache.clear",
   hostedStoresList: "control.hostedStores.list",
   hostedStoresPin: "control.hostedStores.pin",
   hostedStoresUnpin: "control.hostedStores.unpin",

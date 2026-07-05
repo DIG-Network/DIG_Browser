@@ -154,9 +154,9 @@
 +      render_frame_host_->GetLastCommittedOrigin().Serialize();
 +
 +  // CallWalletRpc BLOCKS (drives the in-process wallet runtime), so run it on a
-+  // MayBlock thread-pool task and reply on this sequence — mirrors how the
-+  // dig:// URL loader calls CallDigRpc. Only the origin string + the reply
-+  // callback are captured, so this is safe regardless of the frame's lifetime.
++  // MayBlock thread-pool task and reply on this sequence (the standard DIG
++  // runtime FFI call pattern). Only the origin string + the reply callback are
++  // captured, so this is safe regardless of the frame's lifetime.
 +  base::ThreadPool::PostTaskAndReplyWithResult(
 +      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
 +      base::BindOnce(&dig::CallWalletRpc, origin, request_json),

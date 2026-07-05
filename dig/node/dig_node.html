@@ -361,20 +361,9 @@
       <div id="storesEmpty" class="note muted hidden">No stores hosted yet. Pin one above to start hosting it.</div>
     </section>
 
-    <!-- Cache -->
-    <section class="card" aria-label="Local cache">
-      <h2>Cache</h2>
-      <p class="cd">The on-disk store cache this node keeps (shared with the browser's
-         in-process node when both run).</p>
-      <div class="stats" id="cacheStats" data-testid="node-cache-stats"></div>
-      <div class="ctl" style="margin-top:12px">
-        <input class="in" id="capInput" type="number" min="64" step="64"
-               placeholder="cap (MiB)" data-testid="node-cap-input" aria-label="Cache cap in MiB"
-               style="max-width:170px;flex:none">
-        <button class="btn btn-sm" id="capApply" type="button" data-testid="node-cap-apply">Set cap</button>
-        <button class="btn btn-sm btn-danger" id="cacheClear" type="button" data-testid="node-cache-clear">Clear cache</button>
-      </div>
-    </section>
+    <!-- Cache configuration is intentionally NOT surfaced here (#44 SoC): the
+         browser is not the node's cache-config UI. The node manages its own
+         on-disk cache on its own control surface. -->
 
     <!-- Sync + config -->
     <section class="card" aria-label="Sync and configuration">
@@ -444,7 +433,6 @@
     var CONTROL_METHODS = {
       status:'control.status',
       configGet:'control.config.get', configSetUpstream:'control.config.setUpstream',
-      cacheGet:'control.cache.get', cacheSetCap:'control.cache.setCap', cacheClear:'control.cache.clear',
       hostedStoresList:'control.hostedStores.list', hostedStoresPin:'control.hostedStores.pin',
       hostedStoresUnpin:'control.hostedStores.unpin', hostedStoresStatus:'control.hostedStores.status',
       syncStatus:'control.sync.status', syncTrigger:'control.sync.trigger'
@@ -798,7 +786,7 @@
     }
     function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
 
-    function loadAll(){ loadStatus(); loadStores(); loadCache(); loadSync(); loadConfig(); }
+    function loadAll(){ loadStatus(); loadStores(); loadSync(); loadConfig(); }
 
     function loadStatus(){
       call(CONTROL_METHODS.status).then(function(c){
@@ -871,20 +859,6 @@
       if (prev) sel.value = prev;
     }
 
-    function loadCache(){
-      call(CONTROL_METHODS.cacheGet).then(function(c){
-        if (handleAuth(c)) return;
-        if (c.kind !== 'ok') { $('cacheStats').innerHTML = '<div class="note bad">'+esc(c.message)+'</div>'; return; }
-        var r = c.result || {};
-        $('cacheStats').innerHTML =
-          statCard('Used', fmtBytes(r.used_bytes)) +
-          statCard('Cap', fmtBytes(r.cap_bytes)) +
-          statCard('Shared', r.shared ? 'Yes' : 'No') +
-          statCard('Location', '<span style="font-size:11px">'+esc(r.dir||'—')+'</span>');
-        if (r.cap_bytes) $('capInput').value = Math.round(r.cap_bytes/1048576);
-      });
-    }
-
     function loadSync(){
       call(CONTROL_METHODS.syncStatus).then(function(c){
         if (handleAuth(c)) return;
@@ -939,24 +913,6 @@
         $('pinBtn').disabled = false;
         if (handleAuth(c)) return;
         if (c.kind === 'ok') { $('pinInput').value=''; note('ok','Pinned.'); loadStores(); }
-        else note(c.kind==='not-supported'?'warn':'bad', c.message);
-      });
-    });
-
-    $('capApply').addEventListener('click', function(){
-      var mib = parseInt($('capInput').value, 10);
-      if (!(mib > 0)) return;
-      call(CONTROL_METHODS.cacheSetCap, {cap_bytes: mib*1048576}).then(function(c){
-        if (handleAuth(c)) return;
-        if (c.kind === 'ok') { note('ok','Cache cap updated.'); loadCache(); }
-        else note(c.kind==='not-supported'?'warn':'bad', c.message);
-      });
-    });
-
-    $('cacheClear').addEventListener('click', function(){
-      call(CONTROL_METHODS.cacheClear).then(function(c){
-        if (handleAuth(c)) return;
-        if (c.kind === 'ok') { note('ok','Cache cleared.'); loadCache(); loadStores(); }
         else note(c.kind==='not-supported'?'warn':'bad', c.message);
       });
     });

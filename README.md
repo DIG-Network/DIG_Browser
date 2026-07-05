@@ -43,16 +43,20 @@ chia://<storeID>/index.html?salt=<hex>            # private store
 
 ### How `chia://` → `rpc.dig.net` works (the native read path)
 
-The native handler (`net/url_request/dig_protocol_handler.cc`) mirrors the
-reference extension exactly, but in C++ with BoringSSL instead of the WASM
-crypto module:
+The native handler mirrors the reference extension exactly, currently in C++
+with BoringSSL (`net/url_request/dig_crypto.*`). **Planned (#44 item 2, build-
+gated):** route verify+decrypt through the shared `digstore` `dig_client` **wasm**
+— the byte-identical artifact the extension/hub/SDK use — so there is exactly ONE
+trustless read-crypto implementation (client-side decrypt stays; only the
+duplicate C++ copy is retired). The pipeline:
 
 1. **Parse the URN** (`dig_urn.cc`) — full form or shorthand, plus `?salt=`.
 2. **Retrieval key** — `retrieval_key = SHA-256(canonical rootless URN)` where the
    canonical rootless URN is `urn:dig:chia:<storeID>/<resourceKey>`
    (`dig_crypto.cc`, SYSTEM.md "Retrieval key"). The URN itself is never sent.
-3. **Fetch** — `POST` JSON-RPC 2.0 `dig.getContent` to the configured DIG RPC
-   endpoint (default `https://rpc.dig.net/`), streaming 3 MiB windows and
+3. **Fetch** — `POST` JSON-RPC 2.0 `dig.getContent` to an **external** dig-node
+   resolved by the §5.3 ladder (custom endpoint > `dig.local` > `localhost:8080`
+   > `rpc.dig.net`; see "source resolution" below), streaming windows and
    reassembling `{ ciphertext, chunk_lens, inclusion_proof, total_length,
    complete, next_offset }` (SYSTEM.md "JSON-RPC 2.0 read methods").
 4. **Verify** — recompute the leaf `SHA-256(ciphertext)` and fold the Merkle
@@ -73,11 +77,14 @@ error page — content is never shown unless it verifies *and* decrypts.
 
 ### Where `chia://` content is read from (source resolution)
 
-The DIG Browser is a **consumer** in the DIG serve/consume split (`SYSTEM.md` →
-"Roles — serving vs consuming"). For every `chia://` read it picks a source **in
-order**:
+The DIG Browser is a **pure RPC consumer** in the DIG serve/consume split
+(`SYSTEM.md` → "Roles — serving vs consuming"): it runs **no in-process node**.
+For every `chia://` read it resolves an **external** dig-node **in order** (§5.3):
 
-1. **A local standalone dig-node**, if one is reachable — preferred, because it
+1. **A custom endpoint**, if you set one in `chrome://settings/dig` — it
+   **overrides** the whole ladder and is used exclusively (your deliberate
+   choice, no silent fallback).
+2. **A local standalone dig-node**, if one is reachable — preferred, because it
    is local/offline-capable and contributes to the network. It is addressed
    `http://dig.local` **first** (the `dig-installer` maps that name to the
    node's privileged `:80` loopback listener), then `http://localhost:8080` (the
@@ -85,17 +92,21 @@ order**:
    liveness probe (confirming `status:"ok"` + `mode:"local-node"`) and **memoizes
    the verdict for ~5s**, so a page's many subresources never each re-probe a
    down node and a single failed probe never stalls a load.
-2. **The browser's own in-process dig-node** otherwise — which itself reaches
-   `rpc.dig.net` when it has no cached capsule.
+3. **The public gateway `https://rpc.dig.net`** otherwise — the final fallback,
+   so a standalone browser with no local node still resolves every request.
 
-Either way the served bytes are **always** verified against the on-chain root
-and decrypted on your device — the source is never trusted (fail-closed). So the
-browser is **fully functional standalone** (no local node needed), and when a
-local dig-node *is* present it consumes from it and they share one `.dig` cache.
+Whichever source serves the bytes, they are **always** verified against the
+on-chain root and decrypted on your device — the source is never trusted
+(fail-closed). So the browser is **fully functional standalone** (no local node
+needed); when a local dig-node *is* present it consumes from it.
 
-- **Disable** consuming from a local node (in-process only) with the
+- **Set a custom node** (or clear it, back to automatic) in **Settings → DIG
+  Network** (`chrome://settings/dig`); it persists in the `dig.custom_node_url`
+  pref and takes precedence over the auto-ladder.
+- **Skip the local node** (go straight to `rpc.dig.net`) with the
   `--disable-local-dig-node` command-line switch.
-- The pure resolution policy (ordering, port, host, probe path, TTL) lives in
+- The pure resolution policy (override precedence, ordering, port, host, probe
+  path, TTL) lives in
   [`dig/node/dig_source_resolution.mjs`](dig/node/dig_source_resolution.mjs)
   with a Node test harness; the native loader mirrors it in C++.
 
@@ -103,16 +114,17 @@ local dig-node *is* present it consumes from it and they share one `.dig` cache.
 
 The DIG Browser is also your node's **controller**. When a local standalone
 **dig-node** is running, open **`dig://node`** ("My Node") to manage it: see its
-status, the **stores it hosts** (pin / unpin), the **cache** (view / clear / set
-cap), **§21 sync** status, and the **upstream** it fetches from. It drives the
-node's `control.*` admin RPCs over loopback only.
+status, the **stores it hosts** (pin / unpin), **§21 sync** status, and the
+**upstream** it fetches from. It drives the node's `control.*` admin RPCs over
+loopback only. (The browser is **not** the node's cache-config UI — cache
+management lives on the node itself, #44 SoC.)
 
 - **Hidden when you have no local node.** Consumption never needs one, so with no
   node present the page shows a **calm, dismissible nudge** instead of an empty
-  controller: it says the browser already works fully on its own (in-process node
-  + `rpc.dig.net`, nothing to install to browse), then invites installing a
-  **standalone dig-node** to run a full node, contribute to the network, share
-  your `.dig` cache, and unlock this My Node controller. The **Install dig-node**
+  controller: it says the browser already works fully on its own (it reads from
+  the public gateway `rpc.dig.net`, nothing to install to browse), then invites
+  installing a **standalone dig-node** to run a full node, contribute to the
+  network, and unlock this My Node controller. The **Install dig-node**
   link points at the [`dig-installer` releases](https://github.com/DIG-Network/dig-installer/releases)
   (the same target the `dig-chrome-extension` uses). Never alarmist; dismissing it
   is remembered (localStorage), and "Check again" re-engages.

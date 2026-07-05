@@ -1,8 +1,9 @@
 // DIG Browser "My Node" local PUBLISH / DEPLOY flow — the browser-as-local-hub
-// centrepiece (#95 Pass D). This is the LOCAL, in-process equivalent of the
-// digstore CLI `deploy` / the hub StagingView: launch a brand-new site (MINT a
-// store) or publish an update (ADVANCE a store) entirely on this device, signed
-// by the in-process DIG wallet — no hub spend service.
+// centrepiece (#95 Pass D). This is the on-device equivalent of the digstore CLI
+// `deploy` / the hub StagingView: launch a brand-new site (MINT a store) or
+// publish an update (ADVANCE a store) via a LOCAL dig-node, signed by the
+// in-process DIG wallet — no hub spend service. (The browser runs no content
+// node of its own — #44 SoC; publishing drives a local standalone dig-node.)
 //
 // SERVE/CONSUME split (SYSTEM.md → "Roles — serving vs consuming"): publishing
 // is the SUPPLY side, so it runs through the node the browser controls. The flow
@@ -10,10 +11,11 @@
 // transport — additive policy only):
 //
 //   1. STAGE / COMPILE a folder → capsule `.module`  ──  `dig.stage`
-//      Served by the dig-node `handle_rpc` dispatch (dig-node crates/dig-node),
-//      which backs BOTH the in-process FFI (`dig::CallDigRpc`) AND a standalone
-//      dig-node's loopback JSON-RPC at POST "/". The My Node page already POSTs
-//      `control.*` to that loopback base, so it reaches `dig.stage` the same way.
+//      Served by the dig-node `handle_rpc` dispatch (dig-node crates/dig-node)
+//      over a LOCAL standalone dig-node's loopback JSON-RPC at POST "/". The My
+//      Node page already POSTs `control.*` to that loopback base, so it reaches
+//      `dig.stage` the same way. Publishing needs a local dig-node — the browser
+//      runs none of its own (#44 SoC: pure RPC consumer).
 //      Request : { dir, store_id?, salt?, metadata? }
 //      Result  : { capsule, store_id, root, module_path, size, content_address,
 //                  files, ephemeral }

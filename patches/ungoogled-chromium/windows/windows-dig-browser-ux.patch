@@ -1,14 +1,16 @@
-# DIG Browser live-path + UX: route dig:// through the local dig-node, render as DIG.
+# DIG Browser live-path + UX: route chia:// through an EXTERNAL dig-node, render as DIG.
 #
-# This patch captures the browser changes that make dig:// load via the in-process
-# DigURLLoaderFactory (the live navigation + subresource path) and that give the
-# browser its DIG identity:
+# This patch captures the browser changes that make chia:// load via the
+# browser-process DigURLLoaderFactory (the live navigation + subresource path) and
+# that give the browser its DIG identity. The browser is a PURE RPC CONSUMER
+# (#44 separation-of-concerns): it runs NO in-process content node.
 #
 #   * chrome/browser/dig/ — the DigURLLoaderFactory source_set: a browser-process
-#     URLLoaderFactory that serves dig:// by POSTing dig.getContent to the local
-#     dig-node sidecar (default http://127.0.0.1:9778/, DIG_RPC_ENDPOINT override),
-#     verifying the Merkle proof against the chain-anchored root (rootless URNs are
-#     resolved via the dig-resolver sidecar) and decrypting client-side;
+#     URLLoaderFactory that serves chia:// content by POSTing dig.getContent to an
+#     EXTERNAL dig-node over the §5.3 ladder (custom endpoint > dig.local >
+#     localhost:8080 > rpc.dig.net), verifying the Merkle proof against the
+#     chain-anchored root and decrypting client-side (fail-closed). It runs no
+#     in-process node and keeps no content cache;
 #   * chrome_content_browser_client.cc — register that factory for BOTH DIG
 #     schemes (dig:// internal pages + chia:// content) for navigations + subresources;
 #   * theme_service.cc — seed the DIG palette (dark + brand violet #5800D6) on a
@@ -25,8 +27,12 @@
 #     fetch/wasm-capable so those pages can fetch() subresources and instantiate wasm;
 #   * chrome/browser/BUILD.gn — depend on //chrome/browser/dig;
 #   * chrome_browser_main.cc — at PostBrowserStart, LoadLibrary("dig_runtime.dll")
-#     and call dig_runtime_start(): the DIG node runs NATIVE in-process (no
-#     dig-node.exe sidecar). build.py stages the cargo-built DLL beside dig.exe.
+#     and call dig_runtime_start() to bring up the in-browser WALLET host only
+#     (#44 SoC: no in-process content node — chia:// content resolves via an
+#     external dig-node, see dig_url_loader_factory.cc). build.py stages the
+#     cargo-built DLL beside dig.exe. (Fully removing the node from the runtime is
+#     a companion dig-node change: dig_runtime_start() should start ONLY the
+#     wallet, not dig_rpc / P2P / cache.)
 #   * chrome_render_frame_observer.cc — at DidClearWindowObject, inject the
 #     built-in Chia wallet provider (window.chia, CHIP-0002) into every http/
 #     https/dig page; the provider proxies to the in-process wallet over loopback
@@ -307,10 +313,10 @@
 +CLOSE
 --- a/chrome/browser/ui/browser_ui_prefs.cc
 +++ b/chrome/browser/ui/browser_ui_prefs.cc
-@@ -116,9 +116,12 @@
+@@ -116,9 +116,20 @@
    registry->RegisterIntegerPref(prefs::kSessionRestoreInfoBarTimesShown, 0);
  #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
- 
+
 -  registry->RegisterBooleanPref(prefs::kHomePageIsNewTabPage, true,
 +  // DIG Browser: show the home button by default and make "home" the DIG
 +  // Network site (the home button is the DIG-coin button in the top-left that
@@ -320,6 +326,14 @@
 -  registry->RegisterBooleanPref(prefs::kShowHomeButton, false,
 +  registry->RegisterBooleanPref(prefs::kShowHomeButton, true,
                                  pref_registration_flags);
++  // DIG Browser (#44): the user's optional custom DIG node endpoint. Empty =
++  // the automatic §5.3 ladder (dig.local > localhost > rpc.dig.net); non-empty
++  // = the exclusive override. Set in chrome://settings/dig (dig_page.ts), read
++  // by the chia:// loader (dig_url_loader_factory.cc). Keep the key
++  // "dig.custom_node_url" in sync across those sites and
++  // dig/node/dig_source_resolution.mjs.
++  registry->RegisterStringPref("dig.custom_node_url", std::string(),
++                               pref_registration_flags);
    registry->RegisterBooleanPref(prefs::kSplitViewDragAndDropEnabled, true,
                                  pref_registration_flags);
 @@ -142,8 +145,9 @@
@@ -402,13 +416,16 @@
  #include "base/task/current_thread.h"
  #include "base/task/single_thread_task_runner.h"
  #include "base/task/thread_pool.h"
-@@ -1652,6 +1653,11 @@
+@@ -1652,6 +1653,14 @@
      chrome_extra_part->PostBrowserStart();
    }
  
-+  // DIG: bring up the native in-process DIG runtime — the browser process IS the
-+  // DIG node (dig_runtime.dll loaded in-process, called directly via FFI). No
-+  // loopback server, no dig-node.exe sidecar.
++  // DIG (#44 SoC): bring up the in-browser WALLET host from dig_runtime.dll
++  // (loaded in-process, called via FFI for the window.chia wallet only). The
++  // browser runs NO in-process content node — chia:// content resolves via an
++  // EXTERNAL dig-node over the §5.3 ladder (dig_url_loader_factory.cc). Fully
++  // dropping the node from the runtime is a companion dig-node change
++  // (dig_runtime_start() → wallet-only).
 +  dig::StartNativeRuntime();
 +
    browser_process_->browser_policy_connector()->OnBrowserStarted();
@@ -762,7 +779,7 @@
 +}  // namespace dig
 --- /dev/null
 +++ b/chrome/browser/dig/BUILD.gn
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,30 @@
 +# Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -784,6 +801,8 @@
 +    "//content/public/browser",
 +    "//mojo/public/cpp/bindings",
 +    "//mojo/public/cpp/system",
++    "//components/prefs",
++    "//components/user_prefs",
 +    "//components/version_info",
 +    "//net",
 +    "//services/network/public/cpp",
@@ -793,7 +812,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/dig/dig_native_runtime.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,36 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -803,22 +822,20 @@
 +
 +#include <string>
 +
-+// The DIG browser process IS the DIG node. dig_runtime.dll (a cargo cdylib
-+// shipped next to the browser executable) is loaded in-process and its
-+// dig_rpc(request_json) -> response_json entrypoint is called DIRECTLY — there
-+// is no loopback server and no dig-node.exe sidecar.
++// The in-browser WALLET host (#44 SoC). dig_runtime.dll (a cargo cdylib shipped
++// next to the browser executable) is loaded in-process to back the built-in
++// window.chia wallet (dig_wallet_rpc + the dig://wallet UI host). The browser
++// runs NO in-process CONTENT node — chia:// content resolves via an EXTERNAL
++// dig-node over the §5.3 ladder (dig_url_loader_factory.cc), so dig_rpc (the
++// node read RPC) is NOT called from the browser. (Fully dropping the node from
++// the runtime is a companion dig-node change: dig_runtime_start() should start
++// only the wallet.)
 +namespace dig {
 +
-+// Load dig_runtime.dll (next to the browser executable) and start the native
-+// in-process DIG runtime. Call once at browser startup, on the UI thread.
-+// Best-effort: a no-op if the DLL is absent (dig:// simply can't serve yet).
++// Load dig_runtime.dll (next to the browser executable) and start the in-browser
++// wallet host. Call once at browser startup, on the UI thread. Best-effort: a
++// no-op if the DLL is absent (the built-in wallet simply isn't available).
 +void StartNativeRuntime();
-+
-+// Execute one DIG JSON-RPC request in-process (dig_rpc) and return the JSON
-+// response, or an empty string on failure. BLOCKING — drives the request to
-+// completion on the runtime's threads — so call ONLY from a thread allowed to
-+// block (a base::MayBlock task), never the UI/IO thread. Thread-safe.
-+std::string CallDigRpc(const std::string& request_json);
 +
 +// Execute one wallet (CHIP-0002 window.chia) request in-process (dig_wallet_rpc)
 +// on behalf of `origin` — the calling frame's UNSPOOFABLE committed origin,
@@ -834,7 +851,7 @@
 +#endif  // CHROME_BROWSER_DIG_DIG_NATIVE_RUNTIME_H_
 --- /dev/null
 +++ b/chrome/browser/dig/dig_native_runtime.cc
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,96 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -851,15 +868,16 @@
 +namespace dig {
 +namespace {
 +
-+// C-ABI exported by dig_runtime.dll (see crates/dig-runtime).
++// C-ABI exported by dig_runtime.dll (see crates/dig-runtime). The browser binds
++// only the wallet surface (#44 SoC): dig_runtime_start + dig_wallet_rpc + dig_free.
++// It does NOT bind dig_rpc — chia:// content resolves via an EXTERNAL dig-node,
++// not the in-process runtime (dig_url_loader_factory.cc).
 +using DigRuntimeStartFn = void (*)();
-+using DigRpcFn = char* (*)(const char*);
 +using DigWalletRpcFn = char* (*)(const char*, const char*);
 +using DigFreeFn = void (*)(char*);
 +
 +struct DigRuntimeLib {
 +  DigRuntimeStartFn start = nullptr;
-+  DigRpcFn rpc = nullptr;
 +  DigWalletRpcFn wallet_rpc = nullptr;
 +  DigFreeFn free_fn = nullptr;
 +  bool attempted = false;
@@ -898,8 +916,6 @@
 +  }
 +  lib.start = reinterpret_cast<DigRuntimeStartFn>(
 +      base::GetFunctionPointerFromNativeLibrary(native, "dig_runtime_start"));
-+  lib.rpc = reinterpret_cast<DigRpcFn>(
-+      base::GetFunctionPointerFromNativeLibrary(native, "dig_rpc"));
 +  lib.wallet_rpc = reinterpret_cast<DigWalletRpcFn>(
 +      base::GetFunctionPointerFromNativeLibrary(native, "dig_wallet_rpc"));
 +  lib.free_fn = reinterpret_cast<DigFreeFn>(
@@ -913,21 +929,6 @@
 +  if (Lib().start) {
 +    Lib().start();
 +  }
-+}
-+
-+std::string CallDigRpc(const std::string& request_json) {
-+  EnsureLoaded();
-+  DigRuntimeLib& lib = Lib();
-+  if (!lib.rpc || !lib.free_fn) {
-+    return std::string();
-+  }
-+  char* out = lib.rpc(request_json.c_str());
-+  if (!out) {
-+    return std::string();
-+  }
-+  std::string result(out);
-+  lib.free_fn(out);
-+  return result;
 +}
 +
 +std::string CallWalletRpc(const std::string& origin,
@@ -949,7 +950,7 @@
 +}  // namespace dig
 --- /dev/null
 +++ b/chrome/browser/dig/dig_url_loader_factory.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,108 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -964,15 +965,17 @@
 +// RegisterNonNetworkSubresourceURLLoaderFactories in
 +// chrome_content_browser_client.cc) so dig:// resolves natively, end-to-end.
 +//
-+// It follows the SAME contract as the reference dig-chrome-extension and the
-+// ported net::dig::* crypto core (see SYSTEM.md "JSON-RPC 2.0 read methods"):
++// It follows the SAME contract as the reference dig-chrome-extension (see
++// SYSTEM.md "JSON-RPC 2.0 read methods"):
 +//
 +//   1. Parse the URN (net::dig::ParseDigUrn).
 +//   2. retrieval_key = SHA-256(canonical rootless URN).
-+//   3. POST JSON-RPC 2.0 `dig.getContent` to the configured DIG RPC endpoint
-+//      (https://rpc.dig.net/), streaming 3 MiB windows until complete, via a
-+//      fresh network::SimpleURLLoader per window over the browser-process
-+//      SharedURLLoaderFactory captured at Create() time.
++//   3. POST JSON-RPC 2.0 `dig.getContent` to an EXTERNAL dig-node over the §5.3
++//      ladder (custom endpoint > dig.local > localhost:8080 > rpc.dig.net; see
++//      CallNode below), streaming windows until complete, via a fresh
++//      network::SimpleURLLoader per window over the browser-process
++//      SharedURLLoaderFactory captured at Create() time. The browser runs NO
++//      in-process node (#44 SoC).
 +//   4. Verify the Merkle inclusion proof against the trusted root.
 +//   5. Derive the per-URN AES-256 key (HKDF) and decrypt AES-256-GCM-SIV.
 +//   6. Stream the verified + decrypted bytes to the URLLoaderClient with the
@@ -980,9 +983,20 @@
 +//
 +// Verification/decryption are FAIL-CLOSED: a decoy, tampered bytes, or wrong
 +// key surface a branded error page (served 200/text/html) and never content.
++//
++// #44 ITEM 2 (build-gated single-source-of-crypto): steps 1/4/5 currently use
++// the native net::dig::* C++ crypto (a third copy of the read-crypto). The SoC
++// target is to route verify+decrypt through the SHARED digstore `dig_client`
++// wasm (the byte-identical artifact the extension/hub/SDK use) so there is ONE
++// trustless read-crypto impl. That move needs a V8/wasm context and a Chromium
++// build to wire + verify — see the PR / super-issue #44 for the design and the
++// exact C:\d build steps. Client-side decrypt STAYS; only the duplicate C++
++// copy is retired.
 +
 +#ifndef CHROME_BROWSER_DIG_DIG_URL_LOADER_FACTORY_H_
 +#define CHROME_BROWSER_DIG_DIG_URL_LOADER_FACTORY_H_
++
++#include <string>
 +
 +#include "base/memory/scoped_refptr.h"
 +#include "mojo/public/cpp/bindings/pending_receiver.h"
@@ -1017,6 +1031,7 @@
 + private:
 +  DigURLLoaderFactory(
 +      scoped_refptr<network::SharedURLLoaderFactory> network_loader_factory,
++      std::string custom_endpoint,
 +      mojo::PendingReceiver<network::mojom::URLLoaderFactory> factory_receiver);
 +
 +  ~DigURLLoaderFactory() override;
@@ -1031,8 +1046,14 @@
 +      const net::MutableNetworkTrafficAnnotationTag& traffic_annotation)
 +      override;
 +
-+  // Browser-process factory used to POST dig.getContent to the RPC endpoint.
++  // Browser-process factory used to POST dig.getContent to the resolved external
++  // DIG node (custom endpoint > dig.local > localhost > rpc.dig.net).
 +  scoped_refptr<network::SharedURLLoaderFactory> network_loader_factory_;
++
++  // The user's custom node endpoint (§5.3 override), or empty for the automatic
++  // ladder. Read once from the dig.custom_node_url pref at Create(); passed to
++  // each DigURLLoader.
++  std::string custom_endpoint_;
 +};
 +
 +}  // namespace dig
@@ -1040,7 +1061,7 @@
 +#endif  // CHROME_BROWSER_DIG_DIG_URL_LOADER_FACTORY_H_
 --- /dev/null
 +++ b/chrome/browser/dig/dig_url_loader_factory.cc
-@@ -0,0 +1,1315 @@
+@@ -0,0 +1,1442 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1052,7 +1073,6 @@
 +#include "chrome/browser/dig/dig_node_html.inc"      // kDigNodeHtml (My Node)
 +#include "chrome/browser/dig/dig_shields_html.inc"   // kDigShieldsHtml
 +#include "chrome/browser/dig/dig_welcome_html.inc"   // kDigWelcomeHtml
-+#include "chrome/browser/dig/dig_native_runtime.h"
 +#include "components/version_info/version_info.h"
 +
 +#include <algorithm>
@@ -1088,6 +1108,8 @@
 +#include "base/strings/string_split.h"
 +#include "base/strings/string_util.h"
 +#include "base/values.h"
++#include "components/prefs/pref_service.h"
++#include "components/user_prefs/user_prefs.h"
 +#include "content/public/browser/browser_context.h"
 +#include "content/public/browser/storage_partition.h"
 +#include "mojo/public/cpp/bindings/receiver.h"
@@ -1320,17 +1342,21 @@
 +
 +// ---------------------------------------------------------------------------
 +// Source resolution (the CONSUMER side of the serve/consume split, SYSTEM.md →
-+// "Roles — serving vs consuming"). The chia:// read path tries, IN ORDER:
-+//   1. a LOCAL standalone dig-node's read RPC if reachable — preferred
++// "Roles — serving vs consuming"). The browser is a PURE RPC CONSUMER (#44): it
++// runs NO in-process node. The chia:// read path resolves an EXTERNAL dig-node,
++// IN ORDER (§5.3):
++//   1. an explicit user-configured CUSTOM endpoint if set — it OVERRIDES the
++//      whole ladder (used exclusively; no fallback), honoring the user's choice;
++//   2. else a LOCAL standalone dig-node if reachable — preferred
 +//      (local/offline/contributes), addressed http://dig.local FIRST then
 +//      http://localhost:<port> (default 8080);
-+//   2. else the browser's OWN in-process dig-node (the FFI dig::CallDigRpc),
-+//      which itself reaches rpc.dig.net when it has no cached capsule.
++//   3. else the PUBLIC GATEWAY https://rpc.dig.net — the final fallback, so a
++//      standalone browser with no local node still resolves every request.
 +// Whichever source serves the bytes, the loader ALWAYS verifies the Merkle
 +// proof against the on-chain root and decrypts client-side, fail-closed — the
-+// source is NEVER trusted. The PURE policy (ordering/port/host/probe-path/TTL)
-+// is mirrored from dig/node/dig_source_resolution.mjs (which carries the Node
-+// tests for it); change BOTH in lockstep.
++// source is NEVER trusted. The PURE policy (ordering/port/host/probe-path/TTL/
++// override precedence) is mirrored from dig/node/dig_source_resolution.mjs
++// (which carries the Node tests for it); change BOTH in lockstep.
 +// ---------------------------------------------------------------------------
 +
 +// dig-node's canonical local addresses, in preference order. dig.local has NO
@@ -1338,6 +1364,10 @@
 +// listener); the localhost listener uses the default 8080.
 +constexpr char kDigLocalBase[] = "http://dig.local";
 +constexpr char kLocalhostBase[] = "http://localhost:8080";
++// The public gateway — the FINAL fallback (the safety net when no local node is
++// reachable). NEVER the primary endpoint (§5.3). A browser reaches it over the
++// plain-HTTPS public read tier (no DIG-identity client cert).
++constexpr char kPublicGatewayBase[] = "https://rpc.dig.net";
 +// The node serves JSON-RPC at POST "/" and a cheap liveness probe at GET
 +// "/health" (dig-companion server.rs). We probe /health, never a content
 +// method, so a failed probe is fast and side-effect free.
@@ -1369,6 +1399,36 @@
 +    return {};
 +  }
 +  return {kDigLocalBase, kLocalhostBase};
++}
++
++// Normalize a user-entered custom node endpoint (the dig.custom_node_url pref,
++// §5.3) into a base URL WITHOUT a trailing slash, or "" if empty/malformed.
++// MIRRORS normalizeCustomEndpoint() in dig/node/dig_source_resolution.mjs:
++// accept an http(s) URL or a bare host[:port] (assumed http); reject any other
++// scheme; strip trailing slashes so it composes with "/" and "/health" exactly
++// like the ladder candidates. Change BOTH in lockstep.
++std::string NormalizeCustomEndpoint(const std::string& raw) {
++  std::string s(base::TrimWhitespaceASCII(raw, base::TRIM_ALL));
++  if (s.empty()) {
++    return std::string();
++  }
++  // A bare host (no "scheme://") is a friendly convenience → assume http.
++  if (s.find("://") == std::string::npos) {
++    s = base::StrCat({"http://", s});
++  }
++  GURL url(s);
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || !url.has_host()) {
++    return std::string();
++  }
++  // scheme://host[:port] + path, minus any trailing slash(es).
++  std::string base = base::StrCat(
++      {url.scheme(), "://", url.host(),
++       url.has_port() ? base::StrCat({":", url.port()}) : std::string(),
++       url.path()});
++  while (!base.empty() && base.back() == '/') {
++    base.pop_back();
++  }
++  return base;
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -1496,6 +1556,33 @@
 +          policy_exception_justification: "Loopback-only; no off-machine traffic."
 +        })");
 +
++// Traffic annotation for the terminal POST to an OFF-MACHINE DIG node — the
++// public gateway https://rpc.dig.net (the ladder's final fallback) or a
++// user-configured custom endpoint. Like the local case it carries no user
++// identity (credentials omitted) and moves only blind ciphertext + Merkle
++// proofs which are re-verified locally, but it DOES leave the machine.
++const net::NetworkTrafficAnnotationTag kDigGatewayTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("dig_gateway_rpc", R"(
++        semantics {
++          sender: "DIG Browser chia:// loader"
++          description:
++            "Reads DIG content from an off-machine DIG node — the public gateway "
++            "rpc.dig.net (the fallback when no local node is present) or the "
++            "user-configured custom node. The response (blind ciphertext + a "
++            "Merkle inclusion proof) is verified against the on-chain root and "
++            "decrypted locally; the source is never trusted."
++          trigger: "Navigating to a chia:// address or loading a chia:// subresource "
++                   "with no reachable local dig-node (or with a custom node set)."
++          data: "A JSON-RPC dig.getContent/dig.getAnchoredRoot request (store id, "
++                "root, retrieval key, offset/length). No user identity."
++          destination: WEBSITE
++        }
++        policy {
++          cookies_allowed: NO
++          setting: "Set a custom node, or run a local dig-node, in chrome://settings/dig."
++          policy_exception_justification: "Blind ciphertext + proof only; re-verified locally."
++        })");
++
 +// MIME from the resource key extension (mirrors the extension's ctForPath and
 +// net/url_request/dig_protocol_handler.cc MimeForResourceKey).
 +std::string MimeForResourceKey(const std::string& resource_key) {
@@ -1594,13 +1681,15 @@
 + public:
 +  static void CreateAndStart(
 +      scoped_refptr<network::SharedURLLoaderFactory> network_loader_factory,
++      std::string custom_endpoint,
 +      const network::ResourceRequest& request,
 +      mojo::PendingReceiver<network::mojom::URLLoader> loader,
 +      mojo::PendingRemote<network::mojom::URLLoaderClient> client) {
 +    // Owns itself; lives until the client gives up (mojo disconnect) or the
 +    // response (or branded error page) has been fully delivered.
 +    auto* self = new DigURLLoader(std::move(network_loader_factory),
-+                                  std::move(loader), std::move(client));
++                                  std::move(custom_endpoint), std::move(loader),
++                                  std::move(client));
 +    self->Start(request.url);
 +  }
 +
@@ -1619,9 +1708,11 @@
 + private:
 +  DigURLLoader(
 +      scoped_refptr<network::SharedURLLoaderFactory> network_loader_factory,
++      std::string custom_endpoint,
 +      mojo::PendingReceiver<network::mojom::URLLoader> loader,
 +      mojo::PendingRemote<network::mojom::URLLoaderClient> client)
-+      : network_loader_factory_(std::move(network_loader_factory)) {
++      : network_loader_factory_(std::move(network_loader_factory)),
++        custom_endpoint_(std::move(custom_endpoint)) {
 +    receiver_.Bind(std::move(loader));
 +    receiver_.set_disconnect_handler(base::BindOnce(
 +        &DigURLLoader::OnMojoDisconnect, base::Unretained(this)));
@@ -1632,14 +1723,23 @@
 +
 +  // ---- Source resolution -------------------------------------------------
 +  // Run one DIG JSON-RPC request (`request_json`) against the BEST available
-+  // source and deliver the response body to `on_response`. Resolution order
-+  // (SYSTEM.md "Roles — serving vs consuming"): a reachable LOCAL standalone
-+  // dig-node first (http://dig.local then http://localhost:8080), else the
-+  // in-process node (FFI). The body is the node's JSON-RPC response either way;
-+  // the caller always verifies + decrypts it client-side (the source is never
-+  // trusted). `on_response` runs on this sequence.
++  // EXTERNAL source and deliver the response body to `on_response`. Resolution
++  // order (SYSTEM.md "Roles — serving vs consuming", §5.3): the custom endpoint
++  // if set (exclusive override), else a reachable LOCAL standalone dig-node
++  // (http://dig.local then http://localhost:8080), else the PUBLIC GATEWAY
++  // (rpc.dig.net). The browser runs NO in-process node (#44 SoC). The body is
++  // the node's JSON-RPC response either way; the caller always verifies +
++  // decrypts it client-side (the source is never trusted). `on_response` runs on
++  // this sequence.
 +  using NodeResponseCallback = base::OnceCallback<void(std::string)>;
 +  void CallNode(std::string request_json, NodeResponseCallback on_response) {
++    // §5.3: an explicit custom endpoint overrides the whole ladder — it is the
++    // sole source (no probe, no fallback), honoring the user's deliberate choice.
++    if (!custom_endpoint_.empty()) {
++      PostToRemote(custom_endpoint_, std::move(request_json),
++                   std::move(on_response));
++      return;
++    }
 +    std::vector<std::string> candidates = LocalNodeCandidates();
 +    // Drop candidates the memo says are freshly unreachable; keep the rest in
 +    // order (a fresh-reachable one is POSTed directly, an unknown one is probed
@@ -1664,12 +1764,12 @@
 +                     std::string request_json,
 +                     NodeResponseCallback on_response) {
 +    if (index >= plan.size()) {
-+      // Terminal fallback: the browser's own in-process node. BLOCKING FFI, so
-+      // run it on a MayBlock thread and reply on this sequence.
-+      base::ThreadPool::PostTaskAndReplyWithResult(
-+          FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
-+          base::BindOnce(&dig::CallDigRpc, std::move(request_json)),
-+          std::move(on_response));
++      // Terminal fallback: the PUBLIC GATEWAY (rpc.dig.net). The browser runs no
++      // in-process node (#44 SoC), so this off-machine POST is the final source
++      // (no further fallback). Its response is verified + decrypted client-side
++      // like every other source.
++      PostToRemote(kPublicGatewayBase, std::move(request_json),
++                   std::move(on_response));
 +      return;
 +    }
 +    const std::string base_url = plan[index];
@@ -1758,6 +1858,37 @@
 +    PutProbeVerdict(base_url, false);
 +    TryNextSource(std::move(plan), index + 1, std::move(request_json),
 +                  std::move(on_response));
++  }
++
++  // POST the JSON-RPC request to an OFF-MACHINE DIG node (`base_url`): the public
++  // gateway (the ladder's terminal fallback) or the user's custom endpoint (the
++  // §5.3 override). No further fallback — an empty body surfaces as an error to
++  // the caller (which renders the branded error page). Uses the off-machine
++  // traffic annotation (this request leaves the device).
++  void PostToRemote(std::string base_url,
++                    std::string request_json,
++                    NodeResponseCallback on_response) {
++    auto resource_request = std::make_unique<network::ResourceRequest>();
++    resource_request->url = GURL(base_url + "/");
++    resource_request->method = "POST";
++    resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++    resource_request->headers.SetHeader("Content-Type", "application/json");
++    auto loader = network::SimpleURLLoader::Create(
++        std::move(resource_request), kDigGatewayTrafficAnnotation);
++    loader->AttachStringForUpload(request_json, "application/json");
++    network::SimpleURLLoader* raw = loader.get();
++    raw->DownloadToString(
++        network_loader_factory_.get(),
++        base::BindOnce(&DigURLLoader::OnRemoteResponse,
++                       weak_factory_.GetWeakPtr(), std::move(loader),
++                       std::move(on_response)),
++        kLocalNodeMaxResponse);
++  }
++
++  void OnRemoteResponse(std::unique_ptr<network::SimpleURLLoader> loader,
++                        NodeResponseCallback on_response,
++                        std::optional<std::string> body) {
++    std::move(on_response).Run(body ? std::move(*body) : std::string());
 +  }
 +
 +  // Serve dig://node with the local control token injected. `token` is the
@@ -2281,10 +2412,16 @@
 +  mojo::Receiver<network::mojom::URLLoader> receiver_{this};
 +  mojo::Remote<network::mojom::URLLoaderClient> client_;
 +
-+  // Captured at construction. Used to POST/GET to a LOCAL standalone dig-node
-+  // over loopback HTTP (CallNode → /health probe + dig.getContent POST) when one
-+  // is the preferred source; the in-process node path uses the FFI instead.
++  // Captured at construction. Used to POST/GET to any EXTERNAL DIG node over
++  // HTTP: a LOCAL standalone dig-node over loopback (CallNode → /health probe +
++  // dig.getContent POST), the public gateway (rpc.dig.net), or the custom
++  // endpoint. The browser runs no in-process node (#44 SoC).
 +  scoped_refptr<network::SharedURLLoaderFactory> network_loader_factory_;
++
++  // The user's custom node endpoint (§5.3 override), or empty for the automatic
++  // ladder. Captured from the dig.custom_node_url pref by the factory and passed
++  // in at construction; when set it is the sole source (see CallNode).
++  std::string custom_endpoint_;
 +
 +  net::dig::ParsedUrn parsed_;
 +  std::string chain_;
@@ -2328,9 +2465,18 @@
 +      browser_context->GetDefaultStoragePartition()
 +          ->GetURLLoaderFactoryForBrowserProcess();
 +
++  // Read the user's custom node endpoint (§5.3 override) from the profile pref,
++  // normalized like dig/node/dig_source_resolution.mjs. UserPrefs::Get avoids a
++  // //chrome/browser/profiles dependency. Empty = the automatic ladder.
++  std::string custom_endpoint;
++  if (PrefService* prefs = user_prefs::UserPrefs::Get(browser_context)) {
++    custom_endpoint = NormalizeCustomEndpoint(prefs->GetString("dig.custom_node_url"));
++  }
++
 +  // The DigURLLoaderFactory deletes itself when there are no more receivers —
 +  // see network::SelfDeletingURLLoaderFactory::OnDisconnect.
 +  new DigURLLoaderFactory(std::move(network_loader_factory),
++                          std::move(custom_endpoint),
 +                          pending_remote.InitWithNewPipeAndPassReceiver());
 +
 +  return pending_remote;
@@ -2338,9 +2484,11 @@
 +
 +DigURLLoaderFactory::DigURLLoaderFactory(
 +    scoped_refptr<network::SharedURLLoaderFactory> network_loader_factory,
++    std::string custom_endpoint,
 +    mojo::PendingReceiver<network::mojom::URLLoaderFactory> factory_receiver)
 +    : network::SelfDeletingURLLoaderFactory(std::move(factory_receiver)),
-+      network_loader_factory_(std::move(network_loader_factory)) {}
++      network_loader_factory_(std::move(network_loader_factory)),
++      custom_endpoint_(std::move(custom_endpoint)) {}
 +
 +DigURLLoaderFactory::~DigURLLoaderFactory() = default;
 +
@@ -2351,8 +2499,8 @@
 +    const network::ResourceRequest& request,
 +    mojo::PendingRemote<network::mojom::URLLoaderClient> client,
 +    const net::MutableNetworkTrafficAnnotationTag& traffic_annotation) {
-+  DigURLLoader::CreateAndStart(network_loader_factory_, request,
-+                               std::move(loader), std::move(client));
++  DigURLLoader::CreateAndStart(network_loader_factory_, custom_endpoint_,
++                               request, std::move(loader), std::move(client));
 +}
 +
 +}  // namespace dig

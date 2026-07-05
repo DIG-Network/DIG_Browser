@@ -155,19 +155,27 @@ configuration lives with the node.
 
 ## 10. Transition (#41/#44)
 
-The fork is mid-migration to the pure-RPC-consumer contract above (super-repo #44, per the #41
-separation-of-concerns ruling). The remaining code deltas from the previous "browser runs an
-in-process node" architecture are:
+The fork is completing its migration to the pure-RPC-consumer contract above (super-repo #44, per the
+#41 separation-of-concerns ruling). Status of the four code deltas from the previous "browser runs an
+in-process node" architecture:
 
-- **Remove the in-process node** (the `dig-runtime` cdylib loaded at PostBrowserStart) and make the
-  terminal fallback of the §4 ladder `rpc.dig.net` instead of an in-process node. This ships gated on
-  the dig-installer reliably delivering a local dig-node (#40) AND a buildable release (#26).
-- **Single-source the read-crypto** — drop the native C++ `net::dig` DigURLLoader read-crypto copy in
-  favor of the shared wasm (§5).
+- **Remove the in-process node** — LANDED on the consumer read path: `dig/node/dig_source_resolution.mjs`
+  and the native `dig_url_loader_factory.cc` no longer have an `in-process` terminal; the §4 ladder now
+  terminates at the public gateway `rpc.dig.net`, and the loader never calls the runtime's node RPC
+  (`dig_rpc`). The `dig-runtime` DLL is still loaded at PostBrowserStart for the in-browser WALLET only
+  (§6). FULLY removing the node process requires a companion `dig-node` change so
+  `dig_runtime_start()` starts only the wallet (not `dig_rpc`/P2P/cache); until then the ecosystem
+  relies on the dig-installer delivering a standalone local dig-node (#40) with `rpc.dig.net` as the
+  guaranteed fallback. Ships once verified on a buildable release (#26).
+- **Single-source the read-crypto** — PENDING (build-gated). The native C++ `net::dig` read-crypto
+  (`net/url_request/dig_crypto.*`, `dig_urn.*`) is still the loader's verify+decrypt. The target (§5)
+  is to route verify+decrypt through the shared `digstore` `dig_client` wasm so there is exactly ONE
+  trustless read-crypto implementation. That move needs a V8/wasm execution context and a Chromium
+  build to wire and verify (design + steps tracked on super-issue #44); client-side decrypt STAYS.
 - **Remove the `chrome://settings/dig` cache section** + the `DigCacheHandler` Mojo + the "My Node"
-  cache card (§1).
-- **Add the custom-node setting** (§4.3).
+  cache card (§1) — DONE.
+- **Add the custom-node setting** (§4.3) — DONE (the `chrome://settings/dig` section now hosts the
+  persisted custom node endpoint pref, `dig.custom_node_url`).
 
-Until the in-process node is removed, `dig/node/dig_source_resolution.mjs` still lists an `in-process`
-terminal step; the target terminal step is `rpc.dig.net`. This section is removed once the migration
-lands.
+This section is removed once the read-crypto single-sourcing (item 2) lands and the full node removal
+is build-verified.

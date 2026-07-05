@@ -1,26 +1,32 @@
 // DIG Browser source-resolution policy (the CONSUMER side of the serve/consume
 // split, SYSTEM.md → "Roles — serving vs consuming").
 //
-// The browser's chia:// read path must, IN ORDER:
-//   1. try a LOCAL standalone dig-node's read RPC if reachable — preferred
-//      because it is local/offline-capable and contributes to the network. It
-//      is addressed http://dig.local FIRST (the dig-installer maps it to the
-//      127.0.0.2:80 loopback listener), then http://localhost:<port> (default
-//      8080 — the dig-node's always-on localhost listener);
-//   2. else fall back to the browser's OWN in-process dig-node (FFI), which
-//      itself reaches rpc.dig.net when it has no cached capsule.
+// Post-#44 the browser is a PURE RPC CONSUMER: it runs NO in-process node. Its
+// chia:// read path resolves an EXTERNAL dig-node's read RPC, IN ORDER (§5.3):
+//   1. an explicit user-configured CUSTOM endpoint if set — it overrides the
+//      whole ladder (the user deliberately chose it, so it is used exclusively);
+//   2. else a LOCAL standalone dig-node if reachable — preferred because it is
+//      local/offline-capable and contributes to the network. Addressed
+//      http://dig.local FIRST (the dig-installer maps it to the 127.0.0.2:80
+//      loopback listener), then http://localhost:<port> (default 8080 — the
+//      dig-node's always-on localhost listener);
+//   3. else the PUBLIC GATEWAY https://rpc.dig.net — the final fallback, so a
+//      standalone browser with no local node still resolves every request.
 //
 // The source is NEVER trusted: whichever node serves the bytes, the browser
 // ALWAYS verifies the Merkle inclusion proof against the on-chain root and
-// decrypts client-side, fail-closed (that happens in the loader, not here).
+// decrypts client-side, fail-closed (that happens in the loader via the shared
+// dig_client read-crypto, not here).
 //
 // This module is the SINGLE SOURCE OF TRUTH for the *pure* resolution policy —
-// the candidate ordering, the setting gate, and the short-TTL reachability
-// memo. The native loader (chrome/browser/dig/dig_url_loader_factory.cc, added
-// by windows-dig-browser-ux.patch) mirrors this exact logic in C++ (it cannot
+// the candidate ordering, the setting gate, the custom-endpoint override, and
+// the short-TTL reachability memo. The native loader
+// (chrome/browser/dig/dig_url_loader_factory.cc, added by
+// windows-dig-browser-ux.patch) mirrors this exact logic in C++ (it cannot
 // import JS). Keeping the policy here lets it be unit-tested with no Chromium
 // build; the C++ side carries a pointer back to this file. Any change to the
-// ordering / port / host / probe-path / TTL must be made in BOTH places.
+// ordering / port / host / probe-path / TTL / override precedence must be made
+// in BOTH places.
 //
 // Run:  node dig/node/dig_source_resolution.test.mjs   (Node >= 18)
 
@@ -29,6 +35,13 @@
 // localhost listener uses the configurable port (default 8080).
 export const DIG_LOCAL_HOST = "dig.local";
 export const DEFAULT_LOCAL_PORT = 8080;
+
+// The public gateway — the FINAL fallback of the ladder (the safety net when no
+// local node is reachable). NEVER the primary endpoint (§5.3): a local node is
+// always preferred. Browsers reach it over the plain-HTTPS public read tier (a
+// browser cannot present a DIG-identity client cert, so it does not use the
+// node-class mTLS path).
+export const RPC_DIG_NET = "https://rpc.dig.net";
 
 // The dig-node serves the JSON-RPC read methods at POST "/" and a cheap liveness
 // probe at GET "/health" (server.rs). We probe /health, never a content method,
@@ -42,18 +55,20 @@ export const RPC_PATH = "/";
 // a down node (which would stall every load). Milliseconds.
 export const PROBE_TTL_MS = 5000;
 
-// Where the browser-served pages reach the source resolver verdict from. Stable
+// Where the browser-served pages read the source resolver verdict from. Stable
 // names so an agent / the controller UI can read the active source posture.
 export const SOURCE_LOCAL_NODE = "local-node"; // a standalone dig-node served it
-export const SOURCE_IN_PROCESS = "in-process"; // the browser's own node served it
+export const SOURCE_PUBLIC_GATEWAY = "public-gateway"; // rpc.dig.net served it
+export const SOURCE_CUSTOM = "custom-endpoint"; // the user's custom node served it
 
 /**
  * Build the ordered list of local standalone dig-node base URLs to try.
  *
  * @param {object} [opts]
  * @param {boolean} [opts.preferLocalNode=true] the user setting; when false the
- *   browser skips the standalone node entirely and consumes via its in-process
- *   node only (always fully functional — a consumer needs no local dig-node).
+ *   browser skips the standalone node entirely and consumes straight from the
+ *   public gateway (rpc.dig.net) — always fully functional, a consumer needs no
+ *   local node.
  * @param {number} [opts.port=DEFAULT_LOCAL_PORT] the localhost listener port.
  * @returns {string[]} base URLs WITHOUT a trailing slash, in preference order.
  *   Empty when the setting disables the local node.
@@ -67,6 +82,42 @@ export function localNodeCandidates(opts = {}) {
   // dig.local (bare, no port) first — it is the friendly, installer-provisioned
   // name; then the always-on localhost listener on the configured port.
   return [`http://${DIG_LOCAL_HOST}`, `http://localhost:${port}`];
+}
+
+/**
+ * Normalize a user-entered custom node endpoint into a base URL, or null if it
+ * is empty/malformed. This is the §5.3 "explicitly-configured node" — a
+ * discoverable, persisted setting that OVERRIDES the auto-ladder entirely.
+ *
+ * Accepts an http(s) URL, or a bare host[:port] (assumed http for the friendly
+ * local case). Rejects non-http(s) schemes. Strips any trailing slash(es) so the
+ * result composes with HEALTH_PATH / RPC_PATH exactly like the ladder candidates.
+ *
+ * @param {string} url the raw setting value.
+ * @returns {string|null} a base URL WITHOUT a trailing slash, or null.
+ */
+export function normalizeCustomEndpoint(url) {
+  if (typeof url !== "string") return null;
+  let s = url.trim();
+  if (!s) return null;
+  // A bare host (no scheme) is a friendly convenience → assume http.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) {
+    s = `http://${s}`;
+  }
+  let parsed;
+  try {
+    parsed = new URL(s);
+  } catch (_) {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  if (!parsed.host) return null;
+  // Reconstruct base (scheme + host[:port]) + any path, minus trailing slashes.
+  let base = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  base = base.replace(/\/+$/, "");
+  return base;
 }
 
 /**
@@ -127,30 +178,41 @@ export class ReachabilityMemo {
 }
 
 /**
- * Decide which source to read a chia:// request from, honoring the setting and
- * the reachability memo. This is the ordering decision ONLY — it returns the
- * chosen plan; the caller performs the actual fetch + (always) the client-side
- * verify/decrypt.
+ * Decide which source to read a chia:// request from, honoring the custom
+ * endpoint override, the setting, and the reachability memo. This is the
+ * ordering decision ONLY — it returns the chosen plan; the caller performs the
+ * actual fetch + (always) the client-side verify/decrypt.
  *
- * Resolution order:
- *   1. each local-node candidate that the memo says is reachable (fresh) — in
- *      order. Candidates with no fresh verdict are returned as "probe" steps so
- *      the caller probes /health, records the verdict, and continues.
- *   2. the in-process node (always last, always available — never skipped).
+ * Resolution order (§5.3):
+ *   1. If `customEndpoint` is set → it is the SOLE step (kind 'override'). The
+ *      auto-ladder is not consulted and the public gateway is NOT appended —
+ *      the explicit choice wins entirely.
+ *   2. Else each local-node candidate that the memo says is reachable (fresh) —
+ *      in order. Candidates with no fresh verdict are returned as 'probe' steps
+ *      so the caller probes /health, records the verdict, and continues.
+ *   3. The public gateway (rpc.dig.net) is the terminal 'public-gateway' step —
+ *      always appended (never skipped), so the plan always ends at a reachable
+ *      source.
  *
  * @param {object} args
+ * @param {string} [args.customEndpoint] the normalized custom endpoint base URL
+ *   (from {@link normalizeCustomEndpoint}), or falsy when unset.
  * @param {string[]} args.candidates from {@link localNodeCandidates}.
  * @param {ReachabilityMemo} args.memo
  * @param {number} args.now injected clock (ms).
- * @returns {{plan: Array<{kind:'local'|'probe'|'in-process', baseUrl?:string}>}}
+ * @returns {{plan: Array<{kind:'override'|'local'|'probe'|'public-gateway',
+ *   baseUrl:string}>}}
  *   An ordered plan. The caller walks it: a 'probe' step means GET /health on
- *   baseUrl, and on success treat it as 'local'; 'in-process' is the terminal
- *   fallback (the browser's own node → rpc.dig.net). The plan ALWAYS ends with
- *   an 'in-process' step, so a standalone browser with no local node still
- *   resolves every request.
+ *   baseUrl, and on success treat it as 'local'; 'override' and 'public-gateway'
+ *   are POSTed to directly. The plan ends with 'public-gateway' (unless an
+ *   override replaced the whole ladder).
  */
 export function resolveSourcePlan(args) {
-  const { candidates, memo, now } = args;
+  const { customEndpoint, candidates, memo, now } = args;
+  // An explicit custom endpoint overrides the entire ladder (§5.3).
+  if (customEndpoint) {
+    return { plan: [{ kind: "override", baseUrl: customEndpoint }] };
+  }
   const plan = [];
   for (const baseUrl of candidates || []) {
     const verdict = memo ? memo.get(baseUrl, now) : null;
@@ -164,7 +226,7 @@ export function resolveSourcePlan(args) {
       plan.push({ kind: "probe", baseUrl });
     }
   }
-  // The in-process node is the terminal, always-present fallback.
-  plan.push({ kind: "in-process" });
+  // The public gateway is the terminal, always-present fallback.
+  plan.push({ kind: "public-gateway", baseUrl: RPC_DIG_NET });
   return { plan };
 }
