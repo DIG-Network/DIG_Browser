@@ -23,8 +23,8 @@ DIG Browser MUST:
 - resolve `chia://` and `dig://` requests through an EXTERNAL DIG node's read RPC (§3), following the
   §5.3 node-resolution ladder (§4);
 - verify every retrieved resource's Merkle inclusion proof against the on-chain-anchored root and
-  decrypt it client-side, **fail-closed**, using the shared `digstore` `dig_client` read-crypto wasm —
-  the SAME artifact the hub, extension, and SDK use byte-for-byte (§5);
+  decrypt it client-side, **fail-closed**, calling the digstore **Rust** read-crypto DIRECTLY via FFI
+  (`dig_runtime`'s `dig_read_verify_decrypt`) — the SAME Rust the webpage `dig-client-wasm` wraps (§5);
 - inject a `window.chia` wallet provider (CHIP-0002) backed by the in-browser wallet (§6);
 - surface per-resource proof provenance (Shields, §7) and a page-posture control surface
   (`dig://control`, §8);
@@ -35,8 +35,9 @@ DIG Browser MUST NOT:
 - run an in-process/embedded DIG node, any P2P networking, provider records, or content serving;
 - keep a user-managed on-disk content cache or expose cache-configuration chrome (no
   `chrome://settings/dig` cache section, no cache cap/usage/clear UI, no `DigCacheHandler` Mojo);
-- reimplement the read-crypto in native code — there is exactly ONE trustless read-crypto
-  implementation (the shared wasm).
+- carry a SECOND read-crypto implementation — the browser reuses the ONE `digstore` Rust read-crypto
+  (linked natively via `dig_runtime` FFI). It runs no bespoke native C++ crypto and no wasm; wasm is
+  the webpage binding of that same Rust (hub/extension/SDK), never the browser's.
 
 The trust model is unconditional: **the source is never trusted.** Whichever node serves the bytes,
 the browser independently verifies + decrypts them; a proof failure or decrypt failure yields an error
@@ -111,11 +112,21 @@ After bytes are retrieved from the chosen node, the browser ALWAYS, in-process:
 3. reassembles chunks and serves the plaintext to the renderer only if every step succeeds —
    otherwise it fails closed with an error page.
 
-This is implemented by the shared `digstore` `dig_client` read-crypto **wasm** — the byte-identical
-artifact (same SHA-256) the hub (`apps/web/lib/dig-client`), the `dig-chrome-extension`, and
-`@dignetwork/dig-sdk` consume. There is exactly ONE trustless read-crypto implementation in the
-ecosystem; the browser MUST NOT carry a second (native C++) copy. Client-side decryption is
-load-bearing (it powers Shields, §7) and is never delegated to the node.
+This is implemented by the digstore **Rust** read-crypto, called DIRECTLY via FFI. The browser is a
+native application, so it links the digstore read-crypto crate (`digstore-core`, exported over C-ABI by
+the `dig_runtime` cdylib as `dig_read_verify_decrypt`) and calls the Rust in-process — **WASM is for
+webpages only.** There is exactly ONE trustless read-crypto implementation in the ecosystem — the
+`digstore` Rust — with two bindings over it: the native FFI the browser uses here, and the
+`dig-client-wasm` binding the hub (`apps/web/lib/dig-client`), the `dig-chrome-extension`, and
+`@dignetwork/dig-sdk` (all webpages/JS) use. The browser MUST NOT carry a second copy of the crypto
+(no bespoke native C++, no wasm). Client-side decryption is load-bearing (it powers Shields, §7) and is
+never delegated to the node.
+
+The C++ URL loader (`dig_url_loader_factory.cc`) owns only the NETWORK side — resolve the endpoint
+(§4), fetch the ciphertext + base64 inclusion proof, resolve the chain-anchored root — then hands those
+bytes to `dig_read_verify_decrypt`; it contains NO verify/decrypt logic of its own. A nonzero status
+from the FFI (bad input / verification failure / decrypt failure) is rendered as a fail-closed error
+page, never partial content.
 
 ## 6. Wallet — injected `window.chia`
 
@@ -144,8 +155,10 @@ configuration lives with the node.
 
 ## 9. Conformance
 
-- **Single read-crypto:** the `dig_client` wasm the browser loads MUST be the byte-identical artifact
-  (same SHA-256) used by the hub, extension, and SDK; a divergent copy is a conformance failure.
+- **Single read-crypto:** the browser's verify+decrypt MUST be the digstore Rust read-crypto called via
+  the `dig_runtime` FFI (`dig_read_verify_decrypt`) — the SAME `digstore-core` Rust the hub, extension,
+  and SDK consume through the `dig-client-wasm` binding. A bespoke native C++ crypto copy, or loading
+  the wasm into the browser, is a conformance failure (wasm is the webpage binding, not the browser's).
 - **Ladder parity:** `dig/node/dig_source_resolution.mjs` and its native C++ mirror MUST implement the
   identical ordering, host/port, probe path, and TTL; any change is made in both, in one unit of work.
 - **No node surface:** the shipped browser exposes no node/P2P/cache configuration chrome (§1).
@@ -162,16 +175,18 @@ in-process node" architecture:
 - **Remove the in-process node** — LANDED on the consumer read path: `dig/node/dig_source_resolution.mjs`
   and the native `dig_url_loader_factory.cc` no longer have an `in-process` terminal; the §4 ladder now
   terminates at the public gateway `rpc.dig.net`, and the loader never calls the runtime's node RPC
-  (`dig_rpc`). The `dig-runtime` DLL is still loaded at PostBrowserStart for the in-browser WALLET only
-  (§6). FULLY removing the node process requires a companion `dig-node` change so
-  `dig_runtime_start()` starts only the wallet (not `dig_rpc`/P2P/cache); until then the ecosystem
-  relies on the dig-installer delivering a standalone local dig-node (#40) with `rpc.dig.net` as the
-  guaranteed fallback. Ships once verified on a buildable release (#26).
-- **Single-source the read-crypto** — PENDING (build-gated). The native C++ `net::dig` read-crypto
-  (`net/url_request/dig_crypto.*`, `dig_urn.*`) is still the loader's verify+decrypt. The target (§5)
-  is to route verify+decrypt through the shared `digstore` `dig_client` wasm so there is exactly ONE
-  trustless read-crypto implementation. That move needs a V8/wasm execution context and a Chromium
-  build to wire and verify (design + steps tracked on super-issue #44); client-side decrypt STAYS.
+  (`dig_rpc`). The `dig-runtime` DLL is loaded at PostBrowserStart for the in-browser WALLET (§6) and
+  the read-crypto FFI (§5) only. The companion `dig-node` change that makes this a TRUE zero-node
+  browser has landed: `dig_runtime_start_wallet()` starts the wallet WITHOUT the node engine (no
+  `dig_rpc`/P2P/cache) — the browser calls it at startup (dig-node #47). `rpc.dig.net` + the
+  installer's standalone dig-node (#40) cover content. Ships once verified on a buildable release (#26).
+- **Single-source the read-crypto** — LANDED in code (build-gated verify). The former native C++
+  `net::dig` verify/decrypt (`net/url_request/dig_crypto.*`, `dig_urn.*`) is DELETED; the loader now
+  calls the digstore **Rust** read-crypto directly via the `dig_runtime` FFI `dig_read_verify_decrypt`
+  (§5) — the SAME Rust the webpage `dig-client-wasm` wraps, so there is exactly ONE trustless
+  read-crypto implementation. **WASM is for webpages only; the native browser uses the Rust directly.**
+  Client-side decrypt STAYS (it powers Shields). Needs a Chromium build (#26) to wire the `dig_runtime`
+  link + regenerated patches and verify end-to-end.
 - **Remove the `chrome://settings/dig` cache section** + the `DigCacheHandler` Mojo + the "My Node"
   cache card (§1) — DONE.
 - **Add the custom-node setting** (§4.3) — DONE (the `chrome://settings/dig` section now hosts the

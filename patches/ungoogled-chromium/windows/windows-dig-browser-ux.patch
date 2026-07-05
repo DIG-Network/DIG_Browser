@@ -812,7 +812,7 @@
 +}
 --- /dev/null
 +++ b/chrome/browser/dig/dig_native_runtime.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,72 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -820,21 +820,28 @@
 +#ifndef CHROME_BROWSER_DIG_DIG_NATIVE_RUNTIME_H_
 +#define CHROME_BROWSER_DIG_DIG_NATIVE_RUNTIME_H_
 +
++#include <cstdint>
++#include <optional>
 +#include <string>
++#include <vector>
 +
-+// The in-browser WALLET host (#44 SoC). dig_runtime.dll (a cargo cdylib shipped
-+// next to the browser executable) is loaded in-process to back the built-in
-+// window.chia wallet (dig_wallet_rpc + the dig://wallet UI host). The browser
-+// runs NO in-process CONTENT node — chia:// content resolves via an EXTERNAL
-+// dig-node over the §5.3 ladder (dig_url_loader_factory.cc), so dig_rpc (the
-+// node read RPC) is NOT called from the browser. (Fully dropping the node from
-+// the runtime is a companion dig-node change: dig_runtime_start() should start
-+// only the wallet.)
++// The in-browser bindings to dig_runtime.dll (a cargo cdylib shipped next to the
++// browser executable). The DIG Browser is a pure RPC CONSUMER (#44 SoC): it runs
++// NO in-process content node. It loads dig_runtime.dll for exactly two native
++// surfaces:
++//   * the built-in window.chia WALLET (dig_wallet_rpc) — CallWalletRpc();
++//   * the digstore READ-CRYPTO (dig_read_verify_decrypt) — ReadVerifyDecrypt():
++//     the SAME digstore-core Rust the webpage dig-client-wasm wraps, called
++//     DIRECTLY (native FFI, never wasm — wasm is for webpages only).
++// It starts the runtime WALLET-ONLY (dig_runtime_start_wallet) so no node engine
++// (no dig_rpc / P2P / cache) is spun up; chia:// content resolves via an EXTERNAL
++// dig-node over the §5.3 ladder (dig_url_loader_factory.cc).
 +namespace dig {
 +
-+// Load dig_runtime.dll (next to the browser executable) and start the in-browser
-+// wallet host. Call once at browser startup, on the UI thread. Best-effort: a
-+// no-op if the DLL is absent (the built-in wallet simply isn't available).
++// Load dig_runtime.dll (next to the browser executable) and start the runtime
++// WALLET-ONLY — the wallet host with NO in-process node engine. Call once at
++// browser startup, on the UI thread. Best-effort: a no-op if the DLL is absent
++// (the built-in wallet simply isn't available).
 +void StartNativeRuntime();
 +
 +// Execute one wallet (CHIP-0002 window.chia) request in-process (dig_wallet_rpc)
@@ -846,17 +853,48 @@
 +std::string CallWalletRpc(const std::string& origin,
 +                          const std::string& request_json);
 +
++// dig_read_verify_decrypt status codes — mirror the Rust DIG_READ_* constants
++// (crates/dig-runtime/src/lib.rs). See ReadVerifyDecrypt().
++inline constexpr int32_t kDigReadOk = 0;
++inline constexpr int32_t kDigReadBadInput = 1;
++inline constexpr int32_t kDigReadVerifyFailed = 2;
++inline constexpr int32_t kDigReadDecryptFailed = 3;
++inline constexpr int32_t kDigReadInternal = 4;
++
++// Verify + decrypt one served DIG resource by calling dig_runtime.dll's
++// dig_read_verify_decrypt — the digstore-core Rust read-crypto (the SAME Rust the
++// webpage dig-client-wasm wraps). Verifies the served `ciphertext`'s Merkle
++// inclusion against the chain-anchored `trusted_root_hex`, then AES-256-GCM-SIV
++// decrypts it, FAIL-CLOSED. `resource_key` "" resolves to index.html; `salt_hex`
++// is the private-store secret salt hex (nullopt/"" for a public store);
++// `chunk_lens` are the per-chunk ciphertext byte lengths (empty => single chunk).
++// On success fills `out_plaintext` and returns true; on ANY failure returns false
++// with nothing served. `*out_status` (if non-null) receives the DIG_READ_* code
++// so the caller can distinguish a proof failure from a decrypt failure.
++// BLOCKING/CPU-bound — call from a thread allowed to block, never the UI/IO thread.
++bool ReadVerifyDecrypt(const std::string& store_id_hex,
++                       const std::string& resource_key,
++                       const std::vector<uint8_t>& ciphertext,
++                       const std::string& proof_b64,
++                       const std::string& trusted_root_hex,
++                       const std::optional<std::string>& salt_hex,
++                       const std::vector<uint32_t>& chunk_lens,
++                       std::vector<uint8_t>* out_plaintext,
++                       int32_t* out_status);
++
 +}  // namespace dig
 +
 +#endif  // CHROME_BROWSER_DIG_DIG_NATIVE_RUNTIME_H_
 --- /dev/null
 +++ b/chrome/browser/dig/dig_native_runtime.cc
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,165 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/dig/dig_native_runtime.h"
++
++#include <cstdint>
 +
 +#include "base/base_paths.h"
 +#include "base/files/file_path.h"
@@ -868,18 +906,34 @@
 +namespace dig {
 +namespace {
 +
-+// C-ABI exported by dig_runtime.dll (see crates/dig-runtime). The browser binds
-+// only the wallet surface (#44 SoC): dig_runtime_start + dig_wallet_rpc + dig_free.
-+// It does NOT bind dig_rpc — chia:// content resolves via an EXTERNAL dig-node,
-+// not the in-process runtime (dig_url_loader_factory.cc).
-+using DigRuntimeStartFn = void (*)();
++// C-ABI exported by dig_runtime.dll (see crates/dig-runtime). The browser is a
++// pure RPC consumer (#44 SoC), so it binds ONLY the wallet + read-crypto surface
++// and starts the runtime WALLET-ONLY: dig_runtime_start_wallet + dig_wallet_rpc +
++// dig_read_verify_decrypt + dig_bytes_free + dig_free. It deliberately does NOT
++// bind dig_runtime_start (the full node) or dig_rpc — chia:// content resolves via
++// an EXTERNAL dig-node (dig_url_loader_factory.cc), never an in-process node.
++using DigRuntimeStartWalletFn = void (*)();
 +using DigWalletRpcFn = char* (*)(const char*, const char*);
 +using DigFreeFn = void (*)(char*);
++using DigReadVerifyDecryptFn = int32_t (*)(const char*,
++                                           const char*,
++                                           const uint8_t*,
++                                           size_t,
++                                           const char*,
++                                           const char*,
++                                           const char*,
++                                           const uint32_t*,
++                                           size_t,
++                                           uint8_t**,
++                                           size_t*);
++using DigBytesFreeFn = void (*)(uint8_t*, size_t);
 +
 +struct DigRuntimeLib {
-+  DigRuntimeStartFn start = nullptr;
++  DigRuntimeStartWalletFn start_wallet = nullptr;
 +  DigWalletRpcFn wallet_rpc = nullptr;
 +  DigFreeFn free_fn = nullptr;
++  DigReadVerifyDecryptFn read_verify_decrypt = nullptr;
++  DigBytesFreeFn bytes_free = nullptr;
 +  bool attempted = false;
 +};
 +
@@ -914,20 +968,30 @@
 +  if (!native) {
 +    return;
 +  }
-+  lib.start = reinterpret_cast<DigRuntimeStartFn>(
-+      base::GetFunctionPointerFromNativeLibrary(native, "dig_runtime_start"));
++  lib.start_wallet = reinterpret_cast<DigRuntimeStartWalletFn>(
++      base::GetFunctionPointerFromNativeLibrary(native,
++                                                "dig_runtime_start_wallet"));
 +  lib.wallet_rpc = reinterpret_cast<DigWalletRpcFn>(
 +      base::GetFunctionPointerFromNativeLibrary(native, "dig_wallet_rpc"));
 +  lib.free_fn = reinterpret_cast<DigFreeFn>(
 +      base::GetFunctionPointerFromNativeLibrary(native, "dig_free"));
++  lib.read_verify_decrypt = reinterpret_cast<DigReadVerifyDecryptFn>(
++      base::GetFunctionPointerFromNativeLibrary(native,
++                                                "dig_read_verify_decrypt"));
++  lib.bytes_free = reinterpret_cast<DigBytesFreeFn>(
++      base::GetFunctionPointerFromNativeLibrary(native, "dig_bytes_free"));
 +}
 +
 +}  // namespace
 +
 +void StartNativeRuntime() {
 +  EnsureLoaded();
-+  if (Lib().start) {
-+    Lib().start();
++  // WALLET-ONLY start: the browser runs no in-process content node (#44 SoC). If
++  // the export is absent (an older DLL) we deliberately do NOT fall back to the
++  // full start — that would spin up the node engine and violate the SoC; the
++  // built-in wallet is simply unavailable until a matching dig_runtime.dll ships.
++  if (Lib().start_wallet) {
++    Lib().start_wallet();
 +  }
 +}
 +
@@ -945,6 +1009,47 @@
 +  std::string result(out);
 +  lib.free_fn(out);
 +  return result;
++}
++
++bool ReadVerifyDecrypt(const std::string& store_id_hex,
++                       const std::string& resource_key,
++                       const std::vector<uint8_t>& ciphertext,
++                       const std::string& proof_b64,
++                       const std::string& trusted_root_hex,
++                       const std::optional<std::string>& salt_hex,
++                       const std::vector<uint32_t>& chunk_lens,
++                       std::vector<uint8_t>* out_plaintext,
++                       int32_t* out_status) {
++  out_plaintext->clear();
++  if (out_status) {
++    *out_status = kDigReadInternal;
++  }
++  EnsureLoaded();
++  DigRuntimeLib& lib = Lib();
++  if (!lib.read_verify_decrypt || !lib.bytes_free) {
++    return false;  // DLL / exports absent — fail closed (serve nothing).
++  }
++  const char* salt_c =
++      (salt_hex.has_value() && !salt_hex->empty()) ? salt_hex->c_str() : nullptr;
++  const uint8_t* ct_ptr = ciphertext.empty() ? nullptr : ciphertext.data();
++  const uint32_t* lens_ptr = chunk_lens.empty() ? nullptr : chunk_lens.data();
++  uint8_t* out = nullptr;
++  size_t out_len = 0;
++  int32_t status = lib.read_verify_decrypt(
++      store_id_hex.c_str(), resource_key.c_str(), ct_ptr, ciphertext.size(),
++      proof_b64.c_str(), trusted_root_hex.c_str(), salt_c, lens_ptr,
++      chunk_lens.size(), &out, &out_len);
++  if (out_status) {
++    *out_status = status;
++  }
++  if (status != kDigReadOk) {
++    return false;  // out/out_len are null/0 on failure per the FFI contract.
++  }
++  if (out && out_len > 0) {
++    out_plaintext->assign(out, out + out_len);
++  }
++  lib.bytes_free(out, out_len);  // frees the boxed slice (incl. the empty case).
++  return true;
 +}
 +
 +}  // namespace dig
@@ -976,22 +1081,22 @@
 +//      network::SimpleURLLoader per window over the browser-process
 +//      SharedURLLoaderFactory captured at Create() time. The browser runs NO
 +//      in-process node (#44 SoC).
-+//   4. Verify the Merkle inclusion proof against the trusted root.
-+//   5. Derive the per-URN AES-256 key (HKDF) and decrypt AES-256-GCM-SIV.
-+//   6. Stream the verified + decrypted bytes to the URLLoaderClient with the
++//   4. Verify the Merkle inclusion proof against the chain-anchored root, then
++//      derive the per-URN AES-256 key and AES-256-GCM-SIV-decrypt — ALL via the
++//      digstore Rust read-crypto (dig::ReadVerifyDecrypt -> the dig_runtime FFI
++//      dig_read_verify_decrypt). See FinishResolve below.
++//   5. Stream the verified + decrypted bytes to the URLLoaderClient with the
 +//      extension-derived MIME and an X-Dig-Verified header.
 +//
 +// Verification/decryption are FAIL-CLOSED: a decoy, tampered bytes, or wrong
 +// key surface a branded error page (served 200/text/html) and never content.
 +//
-+// #44 ITEM 2 (build-gated single-source-of-crypto): steps 1/4/5 currently use
-+// the native net::dig::* C++ crypto (a third copy of the read-crypto). The SoC
-+// target is to route verify+decrypt through the SHARED digstore `dig_client`
-+// wasm (the byte-identical artifact the extension/hub/SDK use) so there is ONE
-+// trustless read-crypto impl. That move needs a V8/wasm context and a Chromium
-+// build to wire + verify — see the PR / super-issue #44 for the design and the
-+// exact C:\d build steps. Client-side decrypt STAYS; only the duplicate C++
-+// copy is retired.
++// #44 ITEM 2 (single-source-of-crypto — LANDED): verify+decrypt go through the
++// digstore-core RUST read-crypto, called DIRECTLY via the dig_runtime FFI — the
++// SAME Rust the webpage dig-client-wasm wraps. WASM is for webpages ONLY; the
++// native browser uses the Rust directly. The former native net::dig::* C++
++// verify/decrypt (a third copy) is DELETED; net::dig now provides only URN
++// addressing (ParseDigHostUrl / RetrievalKeyHex). @mt-dev ruling on #44.
 +
 +#ifndef CHROME_BROWSER_DIG_DIG_URL_LOADER_FACTORY_H_
 +#define CHROME_BROWSER_DIG_DIG_URL_LOADER_FACTORY_H_
@@ -1061,13 +1166,14 @@
 +#endif  // CHROME_BROWSER_DIG_DIG_URL_LOADER_FACTORY_H_
 --- /dev/null
 +++ b/chrome/browser/dig/dig_url_loader_factory.cc
-@@ -0,0 +1,1442 @@
+@@ -0,0 +1,1446 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "chrome/browser/dig/dig_url_loader_factory.h"
 +
++#include "chrome/browser/dig/dig_native_runtime.h"  // dig::ReadVerifyDecrypt (FFI)
 +#include "chrome/browser/dig/dig_about_html.inc"     // kDigAboutHtml
 +#include "chrome/browser/dig/dig_home_html.inc"      // kDigHomeHtml (the DIG Home)
 +#include "chrome/browser/dig/dig_node_html.inc"      // kDigNodeHtml (My Node)
@@ -2267,43 +2373,46 @@
 +  }
 +
 +  void FinishResolve() {
-+
-+    // Verify the Merkle inclusion proof, then derive the key and decrypt.
-+    // Verification is required: a failed proof or a decrypt tag failure means
-+    // we serve NO content (fail closed).
-+    verified_ = net::dig::VerifyInclusion(ciphertext_, proof_b64_, root_);
-+    if (!verified_) {
-+      FinishWithError(
-+          "DIG content failed its on-chain integrity check (Merkle proof). "
-+          "It may be tampered or a decoy.",
-+          dig_err::kProofMismatch);
-+      return;
-+    }
-+    // Record this resource's PASSED inclusion proof in the per-capsule ledger
-+    // (dig://shields lists it). Done here, after VerifyInclusion succeeded.
-+    RecordLedgerEntry(parsed_.store_id, root_, resource_key_,
-+                      /*inclusion_proof_passed=*/true, /*error_code=*/"");
-+
-+    const std::string canonical_urn = net::dig::CanonicalRootlessUrn(
-+        chain_, parsed_.store_id, parsed_.resource_key);
-+    uint8_t key[32];
-+    if (!net::dig::DeriveContentKey(canonical_urn, parsed_.salt, key)) {
-+      FinishWithError("DIG content key could not be derived.",
-+                      dig_err::kDecryptTag);
-+      return;
-+    }
-+
++    // Verify the served ciphertext's Merkle inclusion against the chain-anchored
++    // root, then decrypt — ALL via the digstore Rust read-crypto (dig_runtime
++    // FFI, dig::ReadVerifyDecrypt). The browser is native, so it calls the SAME
++    // digstore-core Rust the webpage dig-client-wasm wraps DIRECTLY — no wasm, no
++    // bespoke native C++ crypto (the former net::dig verify/decrypt is deleted).
++    // Fail-closed: a proof or decrypt failure serves NO content. `root_` is always
++    // a concrete chain-anchored root here (resolved in ResolveContent /
++    // OnRootResolved), so the FFI's strict proof-root match is the trust gate.
 +    std::vector<uint8_t> plaintext;
-+    if (!net::dig::DecryptResource(key, ciphertext_, chunk_lens_, &plaintext)) {
++    int32_t status = dig::kDigReadInternal;
++    const bool ok = dig::ReadVerifyDecrypt(
++        parsed_.store_id, parsed_.resource_key, ciphertext_, proof_b64_, root_,
++        parsed_.salt, chunk_lens_, &plaintext, &status);
++    if (ok) {
++      verified_ = true;
++      // Record this resource's PASSED inclusion proof in the per-capsule ledger
++      // (dig://shields lists it).
++      RecordLedgerEntry(parsed_.store_id, root_, resource_key_,
++                        /*inclusion_proof_passed=*/true, /*error_code=*/"");
++      output_.assign(plaintext.begin(), plaintext.end());
++      mime_type_ = MimeForResourceKey(resource_key_);
++      SendResponse();
++      return;
++    }
++
++    // Fail-closed. The FFI distinguishes a decrypt-tag failure (the Merkle proof
++    // PASSED; only the AES-256-GCM-SIV open failed — wrong key/salt or tamper)
++    // from a proof/integrity failure, so Shields records the right verdict.
++    if (status == dig::kDigReadDecryptFailed) {
++      RecordLedgerEntry(parsed_.store_id, root_, resource_key_,
++                        /*inclusion_proof_passed=*/true, /*error_code=*/"");
 +      FinishWithError(
 +          "DIG content could not be decrypted (decoy, wrong key, or tamper).",
 +          dig_err::kDecryptTag);
 +      return;
 +    }
-+
-+    output_.assign(plaintext.begin(), plaintext.end());
-+    mime_type_ = MimeForResourceKey(resource_key_);
-+    SendResponse();
++    FinishWithError(
++        "DIG content failed its on-chain integrity check (Merkle proof). "
++        "It may be tampered or a decoy.",
++        dig_err::kProofMismatch);
 +  }
 +
 +  void FinishWithError(const std::string& message, const std::string& code) {
