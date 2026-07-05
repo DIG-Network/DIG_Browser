@@ -47,14 +47,14 @@ test("control auth scheme matches the dig-node contract (header/param/file)", ()
   assert.equal(CONTROL_TOKEN_FILE, "control-token");
 });
 
-test("canonical control.* method names match the node surface (12 methods)", () => {
+test("canonical control.* method names match the node surface (9 methods)", () => {
+  // No cache.* methods: the browser is not the node's cache-config UI (#44 SoC
+  // — cache management lives on the node's own control surface, not in the
+  // browser).
   assert.deepEqual(CONTROL_METHODS, {
     status: "control.status",
     configGet: "control.config.get",
     configSetUpstream: "control.config.setUpstream",
-    cacheGet: "control.cache.get",
-    cacheSetCap: "control.cache.setCap",
-    cacheClear: "control.cache.clear",
     hostedStoresList: "control.hostedStores.list",
     hostedStoresPin: "control.hostedStores.pin",
     hostedStoresUnpin: "control.hostedStores.unpin",
@@ -62,6 +62,10 @@ test("canonical control.* method names match the node surface (12 methods)", () 
     syncStatus: "control.sync.status",
     syncTrigger: "control.sync.trigger",
   });
+  // the browser no longer surfaces node cache configuration at all.
+  assert.ok(!("cacheGet" in CONTROL_METHODS), "no cache.* control in the browser");
+  assert.ok(!("cacheSetCap" in CONTROL_METHODS));
+  assert.ok(!("cacheClear" in CONTROL_METHODS));
   // every value is a control.*-prefixed string.
   for (const m of Object.values(CONTROL_METHODS)) {
     assert.ok(m.startsWith("control."), `${m} is a control.* method`);

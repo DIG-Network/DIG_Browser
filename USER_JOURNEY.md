@@ -83,14 +83,17 @@ content, a web URL, or DuckDuckGo. Wallet → `dig://wallet`. Publish → DIGHUb
 ## 3. Opening content — `chia://` navigation + verification
 
 When the user opens a `chia://` address (from the omnibox, a link, or a typed
-address), the native dig handler (`windows-add-dig-protocol.patch`) resolves the
-resource end-to-end: fetch from `rpc.dig.net` (or the local cache), verify
-against the on-chain root, decrypt on-device, then commit. The loader is
-**fail-closed** — a `chia://` page only ever renders if it passed verification,
-so a committed `chia://` page is verified by construction.
+address), the native dig handler resolves the resource end-to-end: fetch from an
+**external** dig-node over the §5.3 ladder (custom endpoint > `dig.local` >
+`localhost:8080` > `rpc.dig.net`), verify against the on-chain root, decrypt
+on-device, then commit. The browser runs **no in-process node and keeps no
+content cache** (#44 SoC). The loader is **fail-closed** — a `chia://` page only
+ever renders if it passed verification, so a committed `chia://` page is verified
+by construction.
 
-Locally-cached pages load instantly and offline (the local cache is capped and
-managed in settings — see §6).
+When a local dig-node is present, its cache makes pages load instantly and
+offline — that cache lives with the node, not the browser (set a custom node, or
+run a local one, in Settings — see §6).
 
 ---
 
@@ -115,7 +118,7 @@ per-site control panel:
   telemetry), each shown "On". The copy is framed as a readout of browser-wide
   defaults, not toggles this panel can flip.
 
-**Hand-off:** "Manage DIG settings & cache" → `dig://settings`; "Privacy &
+**Hand-off:** "DIG settings" → `dig://settings`; "Privacy &
 security settings" → `dig://privacy`.
 
 ---
@@ -151,15 +154,21 @@ in-process wallet.
 
 `chrome://settings` (which `dig://settings` rewrites to, at `/dig`) gains a dedicated **DIG
 Network** section (`windows-dig-settings-section.patch`) with its own left-nav
-entry. It exposes the native local-cache controls via a Mojo handler
-(`DigCacheHandler`):
+entry. It exposes the browser's own pure-RPC-consumer setting — the **custom node
+endpoint** (#44 SoC) — as a plain persisted pref (`dig.custom_node_url`), **no
+Mojo, no cache controls**:
 
 - A plain-language intro (the DIG Network is a decentralized web where every page
-  is proven on-chain, secured by the **$DIG** token; visited pages are cached
-  on-device to load fast and offline).
-- A **local cache limit** slider (1–50 GB) with a live usage readout — "Most
-  space DIG Browser may use to store sites from the DIG Network on this device."
-- A **Clear cache** button (content re-warms from `rpc.dig.net` on next visit).
+  is proven on-chain, secured by the **$DIG** token; DIG Browser reads DIG
+  content from a DIG node and verifies it on your device).
+- A **Custom DIG node** input — the address of the node DIG Browser reads content
+  from. When set it is used exclusively, overriding the automatic order (your
+  local node, then the public gateway `rpc.dig.net`); it accepts an `http(s)://`
+  URL or a bare host.
+- A **Use automatic** button that clears the override (back to the auto-ladder).
+
+There is intentionally **no local-cache UI**: the browser owns no node and no
+content cache; cache management lives on the node itself.
 
 ---
 
@@ -167,10 +176,11 @@ entry. It exposes the native local-cache controls via a Mojo handler
 
 When a local **dig-node** is running, `dig://node` ("My Node",
 `dig/node/dig_node.html`) is its controller: status, hosted stores (pin/unpin),
-cache, §21 sync, upstream — over the node's loopback `control.*` RPC, gated by a
+§21 sync, upstream — over the node's loopback `control.*` RPC, gated by a
 control token the browser injects on this device (see the README "Run & manage
-your node"). With no node present the page just explains that and links to
-install one — consumption never needs a node.
+your node"). It is **not** the node's cache-config UI (cache lives with the node,
+#44 SoC). With no node present the page just explains that and links to install
+one — consumption never needs a node.
 
 My Node also has a **Publish** panel — the browser-as-local-hub centrepiece. It
 puts a folder on the DIG Network **from this device**, signed by the in-process
@@ -205,7 +215,7 @@ Hosted-only features (handles, discovery) are labeled "On DIGHUb ↗" cards.
 | DIG identity panel | `dig://shields` | `dig/shields/dig_shields.html` | Verification + privacy posture readout (capsule) |
 | DIG Wallet | `dig://wallet` | in-process DIG runtime | The built-in Chia wallet |
 | My Node + Publish | `dig://node` | `dig/node/dig_node.html` | Run/manage the local node + local launch & deploy |
-| Settings → DIG | `dig://settings` (→ `/dig`) | `windows-dig-settings-section.patch` | Local-cache controls |
+| Settings → DIG | `dig://settings` (→ `/dig`) | `windows-dig-settings-section.patch` | Custom node endpoint (`dig.custom_node_url`) |
 | Injected provider | `window.chia` | `dig/provider/dig_provider.js` | CHIP-0002 wallet bridge for pages |
 
 ## Ecosystem hand-offs
@@ -221,7 +231,8 @@ Hosted-only features (handles, discovery) are labeled "On DIGHUb ↗" cards.
   footer link (the brand logo goes to `dig://home`, not the marketing site).
 - **TibetSwap / dexie / 9mm** — acquire **$DIG** to publish. TibetSwap is
   surfaced on the home Apps directory + footer.
-- **rpc.dig.net** — the read path the native `chia://` handler fetches from
-  (then verifies on-chain + decrypts on-device); the local cache sits in front.
+- **rpc.dig.net** — the public-gateway read path the native `chia://` handler
+  falls back to (then verifies on-chain + decrypts on-device); a local dig-node
+  (custom endpoint / `dig.local` / `localhost`) is preferred ahead of it.
 - **CHIP-0035 / on-chain root** — the source of truth the verified badge and the
   capsule (`storeId:rootHash`) are anchored to.

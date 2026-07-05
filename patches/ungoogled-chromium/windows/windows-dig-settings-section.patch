@@ -1,232 +1,66 @@
-# DIG Browser: chrome://settings DIG section (native local-cache controls).
+# DIG Browser: chrome://settings DIG section (custom node endpoint).
 #
-# Adds a dedicated "DIG" section to chrome://settings (its own left-nav entry,
-# route /dig, and page) exposing the native local-cache controls: a storage-cap
-# slider, live usage readout, and a Clear-cache button. This supersedes the
-# standalone dig-cache settings surface by placing the controls alongside the
-# other Chromium settings, with their own section, per DIG UX guidelines.
+# Adds a dedicated "DIG Network" section to chrome://settings (its own left-nav
+# entry, route /dig, and page) exposing the browser's OWN pure-RPC-consumer
+# setting: an optional CUSTOM DIG node endpoint that overrides the automatic
+# node-resolution ladder (§5.3: custom endpoint > dig.local > localhost >
+# rpc.dig.net). This is the browser's own consumer preference — WHICH external
+# node it reads content from — NOT node configuration; the DIG Browser owns no
+# node and surfaces no node/cache config chrome (#44 separation-of-concerns).
 #
-# Architecture:
-#  * ui/webui/resources/cr_components/dig_cache/ — a Mojo interface
-#    (DigCacheHandler: GetConfig / SetCapBytes / Clear). webui_module_path="/"
-#    so the generated dig_cache.mojom-webui.ts ships + compiles through the
-#    settings bundle (mirroring autofill_ai_enums.mojom), avoiding a CSP
-#    connect-src change (the loopback dig-node RPC is unreachable from a
-#    chrome://settings fetch).
-#  * chrome/browser/ui/webui/cr_components/dig_cache/dig_cache_handler.* — the
-#    browser-process handler. Each method posts a MayBlock task that calls the
-#    in-process DIG runtime (dig::CallDigRpc) with a cache.* JSON-RPC and maps
-#    the result back over Mojo. Bound on SettingsUI via the WebUI interface
-#    binder.
+# Architecture (deliberately simple — no Mojo):
+#  * The setting is a single persisted string pref, dig.custom_node_url,
+#    registered in browser_ui_prefs.cc and read by the native chia:// loader
+#    (chrome/browser/dig/dig_url_loader_factory.cc). Empty = use the automatic
+#    ladder; non-empty = the exclusive override.
 #  * chrome/browser/resources/settings/dig_page/ — the Polymer settings element
-#    (settings-dig-page). The slider is driven by a synthetic PrefObject (the
-#    value is persisted via the Mojo handler, not the prefs store); a guarded
-#    observer pushes user edits to SetCapBytes and reflects the server-clamped
-#    value back.
+#    (settings-dig-page) binds a cr-input directly to that pref via PrefsMixin,
+#    normalizing the value (accept http(s):// or a bare host; strip trailing
+#    slashes) exactly like normalizeCustomEndpoint() in
+#    dig/node/dig_source_resolution.mjs. No handler, no cache controls.
 #  * Standard settings wiring: route (/dig), router, left-nav menu item, view
 #    in settings-main, page-visibility flag, lazy-load registration, and i18n
 #    strings.
+#
+# There is intentionally NO local-cache UI and NO DigCacheHandler Mojo: the
+# browser is not the node's cache-config surface (the node owns its own cache).
 
 --- /dev/null
-+++ b/ui/webui/resources/cr_components/dig_cache/dig_cache.mojom
-@@ -0,0 +1,25 @@
-+// Copyright 2026 The DIG Network Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+module dig_cache.mojom;
-+
-+// The local DIG cache configuration, surfaced in the chrome://settings DIG
-+// section. Sizes are in bytes.
-+struct CacheConfig {
-+  uint64 cap_bytes;
-+  uint64 used_bytes;
-+};
-+
-+// Browser-process handler for the chrome://settings DIG cache section. Pull-on-
-+// open: the page reads the config, sets the cap, or clears the cache. The
-+// browser fulfils each by calling the in-process DIG runtime (CallDigRpc FFI),
-+// which owns the cache.
-+interface DigCacheHandler {
-+  // Current cap + on-disk usage.
-+  GetConfig() => (CacheConfig config);
-+  // Set the LRU cap (bytes); returns the effective cap (floored at 64 MiB).
-+  SetCapBytes(uint64 cap_bytes) => (uint64 effective_cap_bytes);
-+  // Purge the cache (content re-warms from rpc.dig.net on next visit).
-+  Clear() => ();
-+};
---- /dev/null
-+++ b/ui/webui/resources/cr_components/dig_cache/BUILD.gn
-@@ -0,0 +1,17 @@
-+# Copyright 2026 The DIG Network Authors. All rights reserved.
-+# Use of this source code is governed by a BSD-style license that can be
-+# found in the LICENSE file.
-+
-+import("//mojo/public/tools/bindings/mojom.gni")
-+
-+# DIG cache settings interface. Generates C++ bindings (consumed by the
-+# settings WebUI handler) and a WebUI TS module. The generated
-+# dig_cache.mojom-webui.ts is shipped + compiled through the settings bundle
-+# (see chrome/browser/resources/settings/BUILD.gn mojo_files), mirroring how
-+# autofill_ai_enums.mojom is consumed by settings. No component TS/CSS of its
-+# own — the DIG settings element lives in the settings bundle as dig_page.ts.
-+mojom("mojom") {
-+  sources = [ "dig_cache.mojom" ]
-+
-+  webui_module_path = "/"
-+}
---- /dev/null
-+++ b/chrome/browser/ui/webui/cr_components/dig_cache/dig_cache_handler.h
-@@ -0,0 +1,32 @@
-+// Copyright 2026 The DIG Network Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_UI_WEBUI_CR_COMPONENTS_DIG_CACHE_DIG_CACHE_HANDLER_H_
-+#define CHROME_BROWSER_UI_WEBUI_CR_COMPONENTS_DIG_CACHE_DIG_CACHE_HANDLER_H_
-+
-+#include "mojo/public/cpp/bindings/pending_receiver.h"
-+#include "mojo/public/cpp/bindings/receiver.h"
-+#include "ui/webui/resources/cr_components/dig_cache/dig_cache.mojom.h"
-+
-+// Browser-process handler for the chrome://settings DIG cache section. Reads +
-+// writes the local-cache config by calling the in-process DIG runtime
-+// (dig::CallDigRpc — the cache lives in dig-node).
-+class DigCacheHandler : public dig_cache::mojom::DigCacheHandler {
-+ public:
-+  explicit DigCacheHandler(
-+      mojo::PendingReceiver<dig_cache::mojom::DigCacheHandler> receiver);
-+  DigCacheHandler(const DigCacheHandler&) = delete;
-+  DigCacheHandler& operator=(const DigCacheHandler&) = delete;
-+  ~DigCacheHandler() override;
-+
-+  // dig_cache::mojom::DigCacheHandler:
-+  void GetConfig(GetConfigCallback callback) override;
-+  void SetCapBytes(uint64_t cap_bytes, SetCapBytesCallback callback) override;
-+  void Clear(ClearCallback callback) override;
-+
-+ private:
-+  mojo::Receiver<dig_cache::mojom::DigCacheHandler> receiver_;
-+};
-+
-+#endif  // CHROME_BROWSER_UI_WEBUI_CR_COMPONENTS_DIG_CACHE_DIG_CACHE_HANDLER_H_
---- /dev/null
-+++ b/chrome/browser/ui/webui/cr_components/dig_cache/dig_cache_handler.cc
-@@ -0,0 +1,82 @@
-+// Copyright 2026 The DIG Network Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "chrome/browser/ui/webui/cr_components/dig_cache/dig_cache_handler.h"
-+
-+#include <optional>
-+#include <string>
-+#include <utility>
-+
-+#include "base/functional/bind.h"
-+#include "base/json/json_reader.h"
-+#include "base/strings/stringprintf.h"
-+#include "base/task/thread_pool.h"
-+#include "base/values.h"
-+#include "chrome/browser/dig/dig_native_runtime.h"
-+
-+namespace {
-+
-+// Blocking FFI into the in-process DIG runtime — must run on a MayBlock thread.
-+std::string CallDig(std::string request_json) {
-+  return dig::CallDigRpc(request_json);
-+}
-+
-+// Pull a u64 field out of the JSON-RPC "result" dict (response from dig-node).
-+uint64_t ResultU64(const std::string& resp, const char* field) {
-+  std::optional<base::Value> v =
-+      base::JSONReader::Read(resp, base::JSON_PARSE_RFC);
-+  if (v && v->is_dict()) {
-+    if (const base::DictValue* result = v->GetDict().FindDict("result")) {
-+      return static_cast<uint64_t>(result->FindDouble(field).value_or(0));
-+    }
-+  }
-+  return 0;
-+}
-+
-+}  // namespace
-+
-+DigCacheHandler::DigCacheHandler(
-+    mojo::PendingReceiver<dig_cache::mojom::DigCacheHandler> receiver)
-+    : receiver_(this, std::move(receiver)) {}
-+
-+DigCacheHandler::~DigCacheHandler() = default;
-+
-+void DigCacheHandler::GetConfig(GetConfigCallback callback) {
-+  base::ThreadPool::PostTaskAndReplyWithResult(
-+      FROM_HERE, {base::MayBlock()},
-+      base::BindOnce(&CallDig,
-+                     R"({"jsonrpc":"2.0","id":1,"method":"cache.getConfig"})"),
-+      base::BindOnce(
-+          [](GetConfigCallback cb, std::string resp) {
-+            auto config = dig_cache::mojom::CacheConfig::New();
-+            config->cap_bytes = ResultU64(resp, "cap_bytes");
-+            config->used_bytes = ResultU64(resp, "used_bytes");
-+            std::move(cb).Run(std::move(config));
-+          },
-+          std::move(callback)));
-+}
-+
-+void DigCacheHandler::SetCapBytes(uint64_t cap_bytes,
-+                                  SetCapBytesCallback callback) {
-+  std::string req = base::StringPrintf(
-+      R"({"jsonrpc":"2.0","id":1,"method":"cache.setCapBytes",)"
-+      R"("params":{"cap_bytes":%llu}})",
-+      static_cast<unsigned long long>(cap_bytes));
-+  base::ThreadPool::PostTaskAndReplyWithResult(
-+      FROM_HERE, {base::MayBlock()}, base::BindOnce(&CallDig, std::move(req)),
-+      base::BindOnce(
-+          [](SetCapBytesCallback cb, std::string resp) {
-+            std::move(cb).Run(ResultU64(resp, "cap_bytes"));
-+          },
-+          std::move(callback)));
-+}
-+
-+void DigCacheHandler::Clear(ClearCallback callback) {
-+  base::ThreadPool::PostTaskAndReplyWithResult(
-+      FROM_HERE, {base::MayBlock()},
-+      base::BindOnce(&CallDig,
-+                     R"({"jsonrpc":"2.0","id":1,"method":"cache.clear"})"),
-+      base::BindOnce([](ClearCallback cb, std::string) { std::move(cb).Run(); },
-+                     std::move(callback)));
-+}
---- /dev/null
 +++ b/chrome/browser/resources/settings/dig_page/dig_page.ts
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,112 @@
 +// Copyright 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +/**
 + * @fileoverview
-+ * 'settings-dig-page' is the settings page for the DIG Network protocol —
-+ * currently the native local-cache threshold.
++ * 'settings-dig-page' is the settings page for the DIG Network protocol. It
++ * exposes the browser's own pure-RPC-consumer setting: an optional CUSTOM DIG
++ * node endpoint that OVERRIDES the automatic node-resolution ladder (§5.3:
++ * custom endpoint > dig.local > localhost > rpc.dig.net). It is the browser's
++ * OWN consumer preference (which external node to read from) — NOT node
++ * configuration. The browser owns no node and surfaces no node/cache config.
 + */
 +import 'chrome://resources/cr_elements/cr_button/cr_button.js';
-+import '../controls/settings_slider.js';
++import 'chrome://resources/cr_elements/cr_input/cr_input.js';
 +import '../settings_page/settings_section.js';
 +import '../settings_shared.css.js';
 +
 +import {PrefsMixin} from '/shared/settings/prefs/prefs_mixin.js';
-+import {WebUiListenerMixin} from 'chrome://resources/cr_elements/web_ui_listener_mixin.js';
 +import {PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
 +
 +import {getSearchManager} from '../search_settings.js';
 +import type {SettingsPlugin} from '../settings_main/settings_plugin.js';
 +
-+import {DigCacheHandler} from '../dig_cache.mojom-webui.js';
-+import type {DigCacheHandlerRemote} from '../dig_cache.mojom-webui.js';
 +import {getTemplate} from './dig_page.html.js';
 +
-+const GIB: number = 1024 * 1024 * 1024;
++// The persisted browser pref holding the custom node endpoint (empty = use the
++// automatic ladder). Registered in browser_ui_prefs.cc and read by the native
++// chia:// loader (dig_url_loader_factory.cc). Keep this key in sync with those
++// two sites and dig/node/dig_source_resolution.mjs.
++const CUSTOM_NODE_PREF: string = 'dig.custom_node_url';
 +
-+const SettingsDigPageElementBase =
-+    WebUiListenerMixin(PrefsMixin(PolymerElement));
++const SettingsDigPageElementBase = PrefsMixin(PolymerElement);
 +
 +export class SettingsDigPageElement extends SettingsDigPageElementBase
 +    implements SettingsPlugin {
@@ -240,95 +74,56 @@
 +
 +  static get properties() {
 +    return {
-+      // Synthetic pref backing the cache-cap slider. Not a real Chrome pref —
-+      // settings-slider only needs a PrefObject<number> shape (key/type/value)
-+      // to drive the knob; the value (in GiB) is persisted via the DIG mojo
-+      // handler, not the prefs store.
-+      capPref_: {
-+        type: Object,
-+        value() {
-+          return {
-+            key: 'digCacheCapGib',
-+            type: chrome.settingsPrivate.PrefType.NUMBER,
-+            value: 1,
-+          };
-+        },
-+      },
-+
-+      usedBytes_: {
-+        type: Number,
-+        value: 0,
-+      },
-+
-+      capTicks_: {
-+        type: Array,
-+        value() {
-+          return [
-+            {value: 1, label: '1 GB'},
-+            {value: 2, label: '2 GB'},
-+            {value: 5, label: '5 GB'},
-+            {value: 10, label: '10 GB'},
-+            {value: 25, label: '25 GB'},
-+            {value: 50, label: '50 GB'},
-+          ];
-+        },
-+      },
-+
-+      usedLabel_: {
-+        type: String,
-+        computed: 'computeUsedLabel_(usedBytes_, capPref_.value)',
-+      },
++      // Editable text bound to the input; committed to the pref on change after
++      // normalization. Seeded from the pref on ready().
++      nodeUrl_: {type: String, value: ''},
++      nodeUrlInvalid_: {type: Boolean, value: false},
 +    };
 +  }
 +
-+  static get observers() {
-+    return ['onCapPrefChanged_(capPref_.value)'];
-+  }
-+
-+  declare private capPref_: chrome.settingsPrivate.PrefObject<number>;
-+  declare private usedBytes_: number;
-+  declare private capTicks_: Array<{value: number, label: string}>;
-+  declare private usedLabel_: string;
-+
-+  private handler_: DigCacheHandlerRemote = DigCacheHandler.getRemote();
-+  // Suppresses the pref observer while we apply values programmatically (load /
-+  // server-clamped echo), so only genuine user slider edits hit the handler.
-+  private cacheLoaded_: boolean = false;
++  declare private nodeUrl_: string;
++  declare private nodeUrlInvalid_: boolean;
 +
 +  override ready() {
 +    super.ready();
-+    this.refreshConfig_();
++    this.nodeUrl_ = this.getPref<string>(CUSTOM_NODE_PREF).value;
 +  }
 +
-+  private async refreshConfig_() {
-+    const {config} = await this.handler_.getConfig();
-+    this.usedBytes_ = Number(config.usedBytes);
-+    this.cacheLoaded_ = false;
-+    this.set('capPref_.value', Number(config.capBytes) / GIB);
-+    this.cacheLoaded_ = true;
-+  }
-+
-+  private async onCapPrefChanged_() {
-+    if (!this.cacheLoaded_) {
++  // Normalize + persist the endpoint on edit. Mirrors normalizeCustomEndpoint()
++  // in dig/node/dig_source_resolution.mjs: accept http(s):// or a bare host
++  // (assumed http), strip trailing slashes; empty clears the override.
++  private onNodeUrlChanged_() {
++    const raw = (this.nodeUrl_ || '').trim();
++    if (raw === '') {
++      this.nodeUrlInvalid_ = false;
++      this.setPrefValue(CUSTOM_NODE_PREF, '');
 +      return;
 +    }
-+    const {effectiveCapBytes} = await this.handler_.setCapBytes(
-+        BigInt(Math.round(this.capPref_.value * GIB)));
-+    const effGiB = Number(effectiveCapBytes) / GIB;
-+    if (effGiB !== this.capPref_.value) {
-+      this.cacheLoaded_ = false;
-+      this.set('capPref_.value', effGiB);
-+      this.cacheLoaded_ = true;
++    const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)
++        ? raw
++        : `http://${raw}`;
++    let url: URL;
++    try {
++      url = new URL(withScheme);
++    } catch {
++      this.nodeUrlInvalid_ = true;
++      return;
 +    }
++    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
++      this.nodeUrlInvalid_ = true;
++      return;
++    }
++    this.nodeUrlInvalid_ = false;
++    const base =
++        `${url.protocol}//${url.host}${url.pathname}`.replace(/\/+$/, '');
++    this.setPrefValue(CUSTOM_NODE_PREF, base);
 +  }
 +
-+  private async onClearCacheClick_() {
-+    await this.handler_.clear();
-+    this.refreshConfig_();
-+  }
-+
-+  private computeUsedLabel_(used: number, capGiB: number): string {
-+    return `${(used / GIB).toFixed(2)} GB of ${capGiB} GB used`;
++  // Clear the override → back to the automatic ladder.
++  private onResetClick_() {
++    this.nodeUrl_ = '';
++    this.nodeUrlInvalid_ = false;
++    this.setPrefValue(CUSTOM_NODE_PREF, '');
 +  }
 +
 +  // SettingsPlugin implementation
@@ -347,7 +142,7 @@
 +customElements.define(SettingsDigPageElement.is, SettingsDigPageElement);
 --- /dev/null
 +++ b/chrome/browser/resources/settings/dig_page/dig_page.html
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,27 @@
 +<settings-section page-title="$i18n{digPageTitle}"
 +    class="cr-centered-card-container">
 +  <div class="cr-row first">
@@ -355,124 +150,26 @@
 +  </div>
 +  <div class="cr-row">
 +    <div class="flex cr-padded-text">
-+      <div>$i18n{digCacheLimitLabel}</div>
-+      <div class="secondary">$i18n{digCacheLimitSublabel}</div>
++      <div>$i18n{digNodeEndpointLabel}</div>
++      <div class="secondary">$i18n{digNodeEndpointSublabel}</div>
 +    </div>
 +  </div>
-+  <settings-slider class="hr"
-+      pref="{{capPref_}}"
-+      ticks="[[capTicks_]]"
-+      label="$i18n{digCacheLimitLabel}">
-+  </settings-slider>
 +  <div class="cr-row continuation">
-+    <div class="flex secondary">[[usedLabel_]]</div>
++    <cr-input class="flex" id="nodeUrl"
++        value="{{nodeUrl_}}"
++        on-change="onNodeUrlChanged_"
++        invalid="[[nodeUrlInvalid_]]"
++        error-message="$i18n{digNodeEndpointInvalid}"
++        placeholder="$i18n{digNodeEndpointPlaceholder}"
++        spellcheck="false" autocomplete="off">
++    </cr-input>
 +  </div>
 +  <div class="cr-row">
-+    <cr-button on-click="onClearCacheClick_">
-+      $i18n{digClearCacheButton}
++    <cr-button on-click="onResetClick_">
++      $i18n{digNodeEndpointReset}
 +    </cr-button>
 +  </div>
 +</settings-section>
---- a/ui/webui/BUILD.gn
-+++ b/ui/webui/BUILD.gn
-@@ -49,6 +49,7 @@
-     if (!is_android && !is_ios) {
-       public_deps += [
-         "//ui/webui/resources/cr_components/customize_color_scheme_mode:mojom",
-+        "//ui/webui/resources/cr_components/dig_cache:mojom",
-         "//ui/webui/resources/cr_components/history_clusters:mojo_bindings",
-         "//ui/webui/resources/cr_components/most_visited:mojom",
-         "//ui/webui/resources/cr_components/theme_color_picker:mojom",
---- a/chrome/browser/ui/BUILD.gn
-+++ b/chrome/browser/ui/BUILD.gn
-@@ -1351,6 +1351,8 @@
-       "webui/chrome_web_contents_handler.h",
-       "webui/cr_components/customize_color_scheme_mode/customize_color_scheme_mode_handler.cc",
-       "webui/cr_components/customize_color_scheme_mode/customize_color_scheme_mode_handler.h",
-+      "webui/cr_components/dig_cache/dig_cache_handler.cc",
-+      "webui/cr_components/dig_cache/dig_cache_handler.h",
-       "webui/cr_components/history/history_util.cc",
-       "webui/cr_components/history/history_util.h",
-       "webui/cr_components/history_clusters/history_clusters_util.cc",
---- a/chrome/browser/ui/webui/settings/settings_ui.h
-+++ b/chrome/browser/ui/webui/settings/settings_ui.h
-@@ -19,6 +19,7 @@
- #include "mojo/public/cpp/bindings/receiver.h"
- #include "ui/webui/mojo_web_ui_controller.h"
- #include "ui/webui/resources/cr_components/customize_color_scheme_mode/customize_color_scheme_mode.mojom.h"
-+#include "ui/webui/resources/cr_components/dig_cache/dig_cache.mojom.h"
- #include "ui/webui/resources/cr_components/help_bubble/help_bubble.mojom.h"
- 
- #if !BUILDFLAG(IS_CHROMEOS)
-@@ -44,6 +45,7 @@
- #endif  // BUILDFLAG(ENABLE_DICE_SUPPORT)
- 
- class CustomizeColorSchemeModeHandler;
-+class DigCacheHandler;
- namespace settings {
- 
- class SettingsUI;
-@@ -117,6 +119,11 @@
-                                 CustomizeColorSchemeModeHandlerFactory>
-           pending_receiver);
- 
-+  // DIG: the chrome://settings DIG cache section binds this directly (no
-+  // factory — it is a simple pull-on-open handler).
-+  void BindInterface(
-+      mojo::PendingReceiver<dig_cache::mojom::DigCacheHandler> receiver);
-+
-  private:
-   void AddSettingsPageUIHandler(
-       std::unique_ptr<content::WebUIMessageHandler> handler);
-@@ -178,6 +185,8 @@
-                      CustomizeColorSchemeModeHandlerFactory>
-       customize_color_scheme_mode_handler_factory_receiver_{this};
- 
-+  std::unique_ptr<DigCacheHandler> dig_cache_handler_;
-+
-   base::CallbackListSubscription glic_settings_state_subscription_;
- 
-   WEB_UI_CONTROLLER_TYPE_DECL();
---- a/chrome/browser/ui/webui/settings/settings_ui.cc
-+++ b/chrome/browser/ui/webui/settings/settings_ui.cc
-@@ -53,6 +53,7 @@
- #include "chrome/browser/ui/ui_features.h"
- #include "chrome/browser/ui/views/side_panel/customize_chrome/customize_chrome_utils.h"
- #include "chrome/browser/ui/webui/cr_components/customize_color_scheme_mode/customize_color_scheme_mode_handler.h"
-+#include "chrome/browser/ui/webui/cr_components/dig_cache/dig_cache_handler.h"
- #include "chrome/browser/ui/webui/extension_control_handler.h"
- #include "chrome/browser/ui/webui/favicon_source.h"
- #include "chrome/browser/ui/webui/managed_ui_handler.h"
-@@ -860,6 +861,11 @@
-       std::move(pending_receiver));
- }
- 
-+void SettingsUI::BindInterface(
-+    mojo::PendingReceiver<dig_cache::mojom::DigCacheHandler> receiver) {
-+  dig_cache_handler_ = std::make_unique<DigCacheHandler>(std::move(receiver));
-+}
-+
- void SettingsUI::UpdateShowGlicState() {
-   // The visibility of the Glic page can change based on the user accepting the
-   // FRE. Propagate this state to the WebUI value used to display the settings
---- a/chrome/browser/chrome_browser_interface_binders_webui_parts_desktop.cc
-+++ b/chrome/browser/chrome_browser_interface_binders_webui_parts_desktop.cc
-@@ -137,6 +137,7 @@
- #include "ui/webui/resources/cr_components/color_change_listener/color_change_listener.mojom.h"
- #include "ui/webui/resources/cr_components/composebox/composebox.mojom.h"
- #include "ui/webui/resources/cr_components/customize_color_scheme_mode/customize_color_scheme_mode.mojom.h"
-+#include "ui/webui/resources/cr_components/dig_cache/dig_cache.mojom.h"
- #include "ui/webui/resources/cr_components/help_bubble/custom_help_bubble.mojom.h"
- #include "ui/webui/resources/cr_components/history/foreign_sessions.mojom.h"
- #include "ui/webui/resources/cr_components/history/history.mojom.h"
-@@ -668,6 +669,7 @@
- #endif  // BUILDFLAG(ENABLE_DICE_SUPPORT)
-       .Add<customize_color_scheme_mode::mojom::
-                CustomizeColorSchemeModeHandlerFactory>()
-+      .Add<dig_cache::mojom::DigCacheHandler>()
-       .Add<help_bubble::mojom::HelpBubbleHandlerFactory>();
- 
-   if (webui_browser::IsWebUIBrowserEnabled()) {
 --- a/chrome/browser/resources/settings/BUILD.gn
 +++ b/chrome/browser/resources/settings/BUILD.gn
 @@ -101,6 +101,7 @@
@@ -483,30 +180,13 @@
      "downloads_page/downloads_page.ts",
      "glic_page/glic_page.ts",
      "glic_page/glic_login_permissions_page.ts",
-@@ -435,8 +436,14 @@
-     "site_settings/site_settings_shared.css",
-   ]
- 
--  mojo_files_deps = [ "//components/autofill/core/browser/data_model/autofill_ai:mojo_bindings_ts__generator" ]
--  mojo_files = [ "$root_gen_dir/components/autofill/core/browser/data_model/autofill_ai/autofill_ai_enums.mojom-webui.ts" ]
-+  mojo_files_deps = [
-+    "//components/autofill/core/browser/data_model/autofill_ai:mojo_bindings_ts__generator",
-+    "//ui/webui/resources/cr_components/dig_cache:mojom_ts__generator",
-+  ]
-+  mojo_files = [
-+    "$root_gen_dir/components/autofill/core/browser/data_model/autofill_ai/autofill_ai_enums.mojom-webui.ts",
-+    "$root_gen_dir/ui/webui/resources/cr_components/dig_cache/dig_cache.mojom-webui.ts",
-+  ]
- 
-   ts_composite = true
-   ts_definitions = [
 --- a/chrome/browser/resources/settings/route.ts
 +++ b/chrome/browser/resources/settings/route.ts
 @@ -296,6 +296,12 @@
          loadTimeData.getString('downloadsPageTitle'));
    }
- 
-+  // DIG: the DIG Network protocol section (local cache, etc.).
+
++  // DIG: the DIG Network protocol section (custom node endpoint).
 +  if (visibility.dig !== false) {
 +    r.DIG = r.BASIC.createSection(
 +        '/dig', 'dig', loadTimeData.getString('digPageTitle'));
@@ -546,7 +226,7 @@
 @@ -181,6 +181,15 @@
      </div>
    </template>
- 
+
 +  <template is="dom-if" if="[[showPage_(pageVisibility_.dig)]]">
 +    <div slot="view" id="dig">
 +      <template is="dom-if" if="[[renderPlugin_(
@@ -609,17 +289,19 @@
  import './languages_page/languages_page_index_cros.js';
 --- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
 +++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
-@@ -749,6 +749,17 @@
+@@ -749,6 +749,19 @@
    html_source->AddLocalizedStrings(kLocalizedStrings);
  }
- 
+
 +void AddDigStrings(content::WebUIDataSource* html_source) {
 +  static constexpr webui::LocalizedString kLocalizedStrings[] = {
 +      {"digPageTitle", IDS_SETTINGS_DIG},
 +      {"digIntro", IDS_SETTINGS_DIG_INTRO},
-+      {"digCacheLimitLabel", IDS_SETTINGS_DIG_CACHE_LIMIT_LABEL},
-+      {"digCacheLimitSublabel", IDS_SETTINGS_DIG_CACHE_LIMIT_SUBLABEL},
-+      {"digClearCacheButton", IDS_SETTINGS_DIG_CLEAR_CACHE_BUTTON},
++      {"digNodeEndpointLabel", IDS_SETTINGS_DIG_NODE_ENDPOINT_LABEL},
++      {"digNodeEndpointSublabel", IDS_SETTINGS_DIG_NODE_ENDPOINT_SUBLABEL},
++      {"digNodeEndpointPlaceholder", IDS_SETTINGS_DIG_NODE_ENDPOINT_PLACEHOLDER},
++      {"digNodeEndpointInvalid", IDS_SETTINGS_DIG_NODE_ENDPOINT_INVALID},
++      {"digNodeEndpointReset", IDS_SETTINGS_DIG_NODE_ENDPOINT_RESET},
 +  };
 +  html_source->AddLocalizedStrings(kLocalizedStrings);
 +}
@@ -627,7 +309,7 @@
  bool IsWebActuationDisabledForEnterprise(Profile* profile) {
    if (!base::FeatureList::IsEnabled(features::kGlicActor)) {
      return false;
-@@ -4262,6 +4273,7 @@
+@@ -4262,6 +4275,7 @@
    AddAppearanceStrings(html_source, profile);
    AddClearBrowsingDataStrings(html_source, profile);
    AddCommonStrings(html_source, profile);
@@ -653,7 +335,7 @@
      </message>
      <message name="IDS_SETTINGS_SUBPAGE_BUTTON" desc="Accessibility description for a button navigating the user from a settings page to one of the settings subpages.">
        Subpage button
-@@ -975,6 +975,21 @@
+@@ -975,6 +975,27 @@
      <message name="IDS_SETTINGS_DOWNLOADS" desc="Name of the settings page which displays download preferences.">
        Downloads
      </message>
@@ -661,21 +343,27 @@
 +      DIG Network
 +    </message>
 +    <message name="IDS_SETTINGS_DIG_INTRO" desc="Plain-language intro to the DIG Network settings section.">
-+      The DIG Network is a decentralized web where every page is proven on-chain (secured by the $DIG token). Pages you visit are cached on this device so they load fast and offline.
++      The DIG Network is a decentralized web where every page is proven on-chain (secured by the $DIG token). DIG Browser reads DIG content from a DIG node and verifies it on your device. By default it finds a node automatically; set a custom node below to always use your own.
 +    </message>
-+    <message name="IDS_SETTINGS_DIG_CACHE_LIMIT_LABEL" desc="Label for the DIG local-cache storage limit setting.">
-+      Local cache limit
++    <message name="IDS_SETTINGS_DIG_NODE_ENDPOINT_LABEL" desc="Label for the custom DIG node endpoint setting.">
++      Custom DIG node
 +    </message>
-+    <message name="IDS_SETTINGS_DIG_CACHE_LIMIT_SUBLABEL" desc="Sublabel explaining the DIG local-cache storage limit.">
-+      Most space DIG Browser may use to store sites from the DIG Network on this device. Visited sites load locally and show a "local" badge; least-recently-used sites are evicted first.
++    <message name="IDS_SETTINGS_DIG_NODE_ENDPOINT_SUBLABEL" desc="Sublabel explaining the custom DIG node endpoint setting.">
++      The address of the DIG node DIG Browser reads content from. When set, it is used exclusively, overriding the automatic order (your local node, then the public gateway rpc.dig.net). Leave empty to choose a node automatically.
 +    </message>
-+    <message name="IDS_SETTINGS_DIG_CLEAR_CACHE_BUTTON" desc="Button that clears the DIG local cache.">
-+      Clear cache
++    <message name="IDS_SETTINGS_DIG_NODE_ENDPOINT_PLACEHOLDER" desc="Placeholder text for the custom DIG node endpoint input.">
++      Automatic (e.g. https://my-node.example or dig.local)
++    </message>
++    <message name="IDS_SETTINGS_DIG_NODE_ENDPOINT_INVALID" desc="Error shown when the entered DIG node endpoint is not a valid address.">
++      Enter a valid http:// or https:// address.
++    </message>
++    <message name="IDS_SETTINGS_DIG_NODE_ENDPOINT_RESET" desc="Button that clears the custom DIG node endpoint and returns to automatic.">
++      Use automatic
 +    </message>
      <message name="IDS_SETTINGS_DOWNLOAD_LOCATION" desc="Label for the input which allows the user to specify the default download directory." meaning="File location">
        Location
      </message>
-@@ -1754,7 +1769,7 @@
+@@ -1754,7 +1775,7 @@
        Passwords
      </message>
      <message name="IDS_SETTINGS_SAFETY_CHECK_PASSWORDS_FEATURE_UNAVAILABLE" desc="Explains that the password check feature is not available in this version of the browser.">

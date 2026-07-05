@@ -7,15 +7,20 @@
 #
 #   * parse the URN (full urn:dig:<chain>:<storeID>[:<root>]/<resourceKey> form
 #     and the dig:// shorthand, with optional ?salt=<hex> for private stores);
-#   * retrieval_key = SHA-256(canonical rootless URN);
-#   * POST JSON-RPC 2.0 dig.getContent to rpc.dig.net (3 MiB streaming windows);
-#   * verify the Merkle inclusion proof against the trusted root;
-#   * derive the per-URN AES-256 key (HKDF-SHA256) and decrypt AES-256-GCM-SIV;
+#   * retrieval_key = SHA-256(canonical rootless URN) (net/url_request/dig_crypto.cc,
+#     content ADDRESSING only — not the read-crypto);
+#   * POST JSON-RPC 2.0 dig.getContent to an EXTERNAL dig-node over the §5.3 ladder
+#     (dig_url_loader_factory.cc; 3 MiB streaming windows);
+#   * verify the Merkle inclusion proof against the chain-anchored root, then
+#     derive the per-URN AES-256 key and AES-256-GCM-SIV-decrypt — ALL via the
+#     digstore-core Rust read-crypto, called DIRECTLY through the dig_runtime FFI
+#     (dig_read_verify_decrypt; chrome/browser/dig/dig_native_runtime.cc);
 #   * render the verified + decrypted bytes (fail-closed on any tamper/decoy).
 #
-# The native crypto (net/url_request/dig_crypto.cc) is a byte-for-byte C++ port
-# of digstore-core (crypto.rs / merkle.rs / urn.rs) using BoringSSL, so it stays
-# byte-identical to the dig_client WASM the extension/hub/digstore share.
+# There is ONE trustless read-crypto impl in the ecosystem — the digstore-core
+# Rust. The native browser links + calls it via FFI; webpages (extension/hub/SDK)
+# use the SAME Rust through its dig-client-wasm binding. WASM is for webpages only;
+# the browser carries NO native C++ verify/decrypt (#44 SoC; @mt-dev ruling).
 
 --- a/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
 +++ b/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
@@ -388,44 +393,29 @@
    using UrlType = GURL;
 --- /dev/null
 +++ b/net/url_request/dig_crypto.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,42 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +//
-+// Native client-side read-crypto for the DIG Network content contract. This is
-+// a byte-for-byte C++ port of the canonical Rust implementation in
-+// `digstore-core` (crypto.rs + merkle.rs + urn.rs) and the cross-system
-+// contract documented in the ecosystem SYSTEM.md. It implements exactly what
-+// the reference `dig-chrome-extension` does via the `dig_client` WASM, but with
-+// BoringSSL (already a //net dependency) instead of a bundled WASM module:
++// DIG content-ADDRESSING helpers (canonical rootless URN + retrieval key). These
++// are the addressing primitives the chia:// URL loader needs to REQUEST bytes
++// from an external dig-node; they are NOT the trustless read-crypto.
 +//
-+//   * retrieval_key = SHA-256(canonical rootless URN), lowercase hex
-+//       canonical rootless URN = "urn:dig:chia:<store_id>[/<resource_key>]"
++// The trustless verify+decrypt read-crypto lives in ONE place — the digstore-core
++// Rust — and the native browser calls it DIRECTLY via the dig_runtime FFI
++// (dig_read_verify_decrypt; see chrome/browser/dig/dig_native_runtime.h). WASM is
++// only the webpage binding of that same Rust (hub/extension/SDK). The browser
++// carries NO native C++ verify/decrypt (#44 SoC; @mt-dev ruling).
++//
++//   * canonical rootless URN = "urn:dig:chia:<store_id>[/<resource_key>]"
 +//       (empty resource_key resolves to "index.html"); SYSTEM.md "Retrieval key"
-+//   * Merkle inclusion proof verification against the trusted root
-+//       leaf = SHA-256(served_ciphertext) (untagged D5 leaf)
-+//       node = SHA-256(NODE_TAG || left || right), NODE_TAG="digstore:node:v1"
-+//       proof wire (big-endian Chia streamable codec):
-+//         leaf[32] || path_count:u32 || (sibling[32] || is_left:u8)* || root[32]
-+//       SYSTEM.md "Merkle inclusion proof"
-+//   * AES-256 content key = HKDF-SHA256(
-+//         ikm  = canonical rootless URN bytes,
-+//         salt = SHA-256("digstore-hkdf-salt-v1" [|| secret_salt]),
-+//         info = "digstore-aes-256-gcm-key-v1")
-+//       SYSTEM.md "AES-256-GCM-SIV + HKDF-SHA256"
-+//   * AES-256-GCM-SIV decrypt under a FIXED 12-byte zero nonce, ct = data||tag.
-+//
-+// All verification/decryption is FAIL-CLOSED: any tamper / wrong key / decoy
-+// yields an error and no plaintext is ever produced.
++//   * retrieval_key = SHA-256(canonical rootless URN), lowercase hex
 +
 +#ifndef NET_URL_REQUEST_DIG_CRYPTO_H_
 +#define NET_URL_REQUEST_DIG_CRYPTO_H_
 +
-+#include <cstdint>
-+#include <optional>
 +#include <string>
-+#include <vector>
 +
 +#include "net/base/net_export.h"
 +
@@ -433,7 +423,7 @@
 +
 +// Canonical rootless URN string: "urn:dig:chia:<store_id>[/<resource_key>]".
 +// `resource_key` empty -> "index.html" (paper 8.5 default view). This is the
-+// form whose SHA-256 is the retrieval key and whose bytes seed the AES key.
++// form whose SHA-256 is the retrieval key.
 +NET_EXPORT std::string CanonicalRootlessUrn(const std::string& chain,
 +                                            const std::string& store_id_hex,
 +                                            const std::string& resource_key);
@@ -443,75 +433,36 @@
 +                                       const std::string& store_id_hex,
 +                                       const std::string& resource_key);
 +
-+// Derive the 32-byte AES-256 content key. `secret_salt_hex` is the optional
-+// 32-byte private-store secret salt as hex (std::nullopt for public stores).
-+// Returns false on malformed salt hex.
-+NET_EXPORT bool DeriveContentKey(const std::string& canonical_rootless_urn,
-+                                 const std::optional<std::string>& secret_salt_hex,
-+                                 uint8_t out_key[32]);
-+
-+// Verify that `ciphertext` is included under `trusted_root_hex` via the
-+// base64 merkle `proof_b64`. Returns true only if the proof's leaf equals
-+// SHA-256(ciphertext), the path folds (with NODE_TAG) to the proof root, and
-+// (when `trusted_root_hex` is a 64-char hex root) that root matches the proof
-+// root. A `trusted_root_hex` of "latest" means the URN pinned no root, so the
-+// proof root is trusted as served (the GCM-SIV tag remains the hard gate).
-+NET_EXPORT bool VerifyInclusion(const std::vector<uint8_t>& ciphertext,
-+                                const std::string& proof_b64,
-+                                const std::string& trusted_root_hex);
-+
-+// AES-256-GCM-SIV decrypt one chunk (ct = data||16-byte tag) under `key`.
-+// Returns false on tag failure (tamper / wrong key / decoy) — fail-closed.
-+NET_EXPORT bool DecryptChunk(const uint8_t key[32],
-+                             const std::vector<uint8_t>& ciphertext,
-+                             std::vector<uint8_t>* out_plaintext);
-+
-+// Decrypt the reassembled ciphertext split by per-chunk ciphertext lengths
-+// `chunk_lens` (empty => treat the whole blob as one chunk). The sum of
-+// `chunk_lens` MUST equal ciphertext.size(). Returns false on any mismatch or
-+// tag failure. This mirrors the extension's decryptChunks() exactly.
-+NET_EXPORT bool DecryptResource(const uint8_t key[32],
-+                                const std::vector<uint8_t>& ciphertext,
-+                                const std::vector<uint32_t>& chunk_lens,
-+                                std::vector<uint8_t>* out_plaintext);
-+
 +}  // namespace net::dig
 +
 +#endif  // NET_URL_REQUEST_DIG_CRYPTO_H_
 --- /dev/null
 +++ b/net/url_request/dig_crypto.cc
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,59 @@
 +// Copyright (c) 2026 The DIG Network Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
++//
++// DIG content-ADDRESSING only (canonical rootless URN + retrieval key). The
++// trustless verify+decrypt read-crypto is NOT here — the native browser calls the
++// digstore-core Rust DIRECTLY via the dig_runtime FFI (dig_read_verify_decrypt),
++// the SAME Rust the webpage dig-client-wasm wraps. There is ONE read-crypto impl
++// in the ecosystem; the browser carries no native C++ copy (#44 SoC).
 +
 +#include "net/url_request/dig_crypto.h"
 +
-+#include <cstring>
-+
-+#include "base/base64.h"
 +#include "base/containers/span.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/string_util.h"
-+#include "third_party/boringssl/src/include/openssl/aead.h"
-+#include "third_party/boringssl/src/include/openssl/digest.h"
-+#include "third_party/boringssl/src/include/openssl/hkdf.h"
 +#include "third_party/boringssl/src/include/openssl/sha.h"
 +
 +namespace net::dig {
 +
 +namespace {
 +
-+// Cross-system constants — MUST stay byte-identical to digstore-core
-+// (crypto.rs / merkle.rs) and the SYSTEM.md "Shared contracts" table.
-+constexpr char kHkdfSaltDomain[] = "digstore-hkdf-salt-v1";
-+constexpr char kHkdfInfo[] = "digstore-aes-256-gcm-key-v1";
-+constexpr char kNodeTag[] = "digstore:node:v1";
++// The paper 8.5 default view: an empty resource key addresses index.html. MUST
++// stay byte-identical to digstore-core (urn.rs) and the SYSTEM.md contract.
 +constexpr char kDefaultResourceKey[] = "index.html";
-+
-+constexpr size_t kKeyLen = 32;
-+constexpr size_t kNonceLen = 12;
-+constexpr size_t kTagLen = 16;  // AES-GCM-SIV authentication tag.
 +
 +void Sha256(base::span<const uint8_t> data, uint8_t out[SHA256_DIGEST_LENGTH]) {
 +  SHA256_CTX ctx;
@@ -544,187 +495,6 @@
 +  uint8_t digest[SHA256_DIGEST_LENGTH];
 +  Sha256(base::as_byte_span(urn), digest);
 +  return ToLowerHex(digest);
-+}
-+
-+bool DeriveContentKey(const std::string& canonical_rootless_urn,
-+                      const std::optional<std::string>& secret_salt_hex,
-+                      uint8_t out_key[kKeyLen]) {
-+  // salt = SHA-256("digstore-hkdf-salt-v1" [|| secret_salt]).
-+  SHA256_CTX ctx;
-+  SHA256_Init(&ctx);
-+  SHA256_Update(&ctx, kHkdfSaltDomain, std::strlen(kHkdfSaltDomain));
-+  if (secret_salt_hex.has_value() && !secret_salt_hex->empty()) {
-+    std::vector<uint8_t> secret;
-+    if (!base::HexStringToBytes(*secret_salt_hex, &secret)) {
-+      return false;  // malformed private-store salt
-+    }
-+    if (!secret.empty()) {
-+      SHA256_Update(&ctx, secret.data(), secret.size());
-+    }
-+  }
-+  uint8_t salt[SHA256_DIGEST_LENGTH];
-+  SHA256_Final(salt, &ctx);
-+
-+  // okm = HKDF-SHA256(ikm = canonical_urn bytes, salt, info).
-+  return HKDF(out_key, kKeyLen, EVP_sha256(),
-+              reinterpret_cast<const uint8_t*>(canonical_rootless_urn.data()),
-+              canonical_rootless_urn.size(), salt, sizeof(salt),
-+              reinterpret_cast<const uint8_t*>(kHkdfInfo),
-+              std::strlen(kHkdfInfo)) == 1;
-+}
-+
-+bool VerifyInclusion(const std::vector<uint8_t>& ciphertext,
-+                     const std::string& proof_b64,
-+                     const std::string& trusted_root_hex) {
-+  // Decode the base64 proof. Wire layout (big-endian Chia streamable codec):
-+  //   leaf[32] || path_count:u32 || (sibling[32] || is_left:u8)* || root[32]
-+  std::string proof_bytes;
-+  if (!base::Base64Decode(proof_b64, &proof_bytes)) {
-+    return false;
-+  }
-+  const auto* p = reinterpret_cast<const uint8_t*>(proof_bytes.data());
-+  size_t remaining = proof_bytes.size();
-+
-+  if (remaining < 32u + 4u) {
-+    return false;
-+  }
-+  // leaf
-+  uint8_t leaf[32];
-+  std::memcpy(leaf, p, 32);
-+  p += 32;
-+  remaining -= 32;
-+  // path_count (u32 big-endian)
-+  uint32_t path_count = (static_cast<uint32_t>(p[0]) << 24) |
-+                        (static_cast<uint32_t>(p[1]) << 16) |
-+                        (static_cast<uint32_t>(p[2]) << 8) |
-+                        (static_cast<uint32_t>(p[3]));
-+  p += 4;
-+  remaining -= 4;
-+
-+  // Each step is 33 bytes (32 hash + 1 flag); then a trailing 32-byte root.
-+  if (path_count > (proof_bytes.size() / 33u) + 1u) {
-+    return false;  // implausible count, avoid overflow
-+  }
-+  if (remaining < static_cast<size_t>(path_count) * 33u + 32u) {
-+    return false;
-+  }
-+
-+  // The proof leaf MUST equal SHA-256(served ciphertext) (D5 leaf). This binds
-+  // the served bytes to the committed merkle leaf.
-+  uint8_t computed_leaf[SHA256_DIGEST_LENGTH];
-+  Sha256(ciphertext, computed_leaf);
-+  if (std::memcmp(computed_leaf, leaf, 32) != 0) {
-+    return false;
-+  }
-+
-+  // Fold the path up to the root using the NODE domain tag.
-+  uint8_t acc[32];
-+  std::memcpy(acc, leaf, 32);
-+  for (uint32_t i = 0; i < path_count; ++i) {
-+    const uint8_t* sibling = p;
-+    uint8_t is_left = p[32];
-+    p += 33;
-+    remaining -= 33;
-+    if (is_left != 0 && is_left != 1) {
-+      return false;
-+    }
-+    SHA256_CTX ctx;
-+    SHA256_Init(&ctx);
-+    SHA256_Update(&ctx, kNodeTag, std::strlen(kNodeTag));
-+    if (is_left == 1) {
-+      // sibling on the LEFT: node = SHA256(NODE_TAG || sibling || acc)
-+      SHA256_Update(&ctx, sibling, 32);
-+      SHA256_Update(&ctx, acc, 32);
-+    } else {
-+      // sibling on the RIGHT: node = SHA256(NODE_TAG || acc || sibling)
-+      SHA256_Update(&ctx, acc, 32);
-+      SHA256_Update(&ctx, sibling, 32);
-+    }
-+    SHA256_Final(acc, &ctx);
-+  }
-+
-+  // Trailing root from the proof.
-+  const uint8_t* proof_root = p;
-+
-+  // The folded accumulator must equal the proof's stated root.
-+  if (std::memcmp(acc, proof_root, 32) != 0) {
-+    return false;
-+  }
-+
-+  // If the URN pinned a concrete root, the proof root MUST match it. When the
-+  // URN supplied no root the client passes "latest"; the proof root is then the
-+  // served generation root (the GCM-SIV tag is the remaining content gate).
-+  if (trusted_root_hex != "latest" && trusted_root_hex.size() == 64) {
-+    std::vector<uint8_t> trusted;
-+    if (!base::HexStringToBytes(trusted_root_hex, &trusted) ||
-+        trusted.size() != 32) {
-+      return false;
-+    }
-+    if (std::memcmp(trusted.data(), proof_root, 32) != 0) {
-+      return false;
-+    }
-+  }
-+  return true;
-+}
-+
-+bool DecryptChunk(const uint8_t key[kKeyLen],
-+                  const std::vector<uint8_t>& ciphertext,
-+                  std::vector<uint8_t>* out_plaintext) {
-+  if (ciphertext.size() < kTagLen) {
-+    return false;
-+  }
-+  bssl::ScopedEVP_AEAD_CTX ctx;
-+  if (!EVP_AEAD_CTX_init(ctx.get(), EVP_aead_aes_256_gcm_siv(), key, kKeyLen,
-+                         kTagLen, nullptr)) {
-+    return false;
-+  }
-+  static const uint8_t kFixedNonce[kNonceLen] = {0};
-+  out_plaintext->resize(ciphertext.size());  // plaintext <= ciphertext
-+  size_t out_len = 0;
-+  int ok = EVP_AEAD_CTX_open(ctx.get(), out_plaintext->data(), &out_len,
-+                             out_plaintext->size(), kFixedNonce, kNonceLen,
-+                             ciphertext.data(), ciphertext.size(),
-+                             /*ad=*/nullptr, /*ad_len=*/0);
-+  if (ok != 1) {
-+    out_plaintext->clear();
-+    return false;  // tag failure: tamper / wrong key / decoy — fail closed
-+  }
-+  out_plaintext->resize(out_len);
-+  return true;
-+}
-+
-+bool DecryptResource(const uint8_t key[kKeyLen],
-+                     const std::vector<uint8_t>& ciphertext,
-+                     const std::vector<uint32_t>& chunk_lens,
-+                     std::vector<uint8_t>* out_plaintext) {
-+  out_plaintext->clear();
-+
-+  // Empty chunk_lens => whole blob is one GCM-SIV ciphertext.
-+  if (chunk_lens.empty()) {
-+    return DecryptChunk(key, ciphertext, out_plaintext);
-+  }
-+
-+  uint64_t sum = 0;
-+  for (uint32_t len : chunk_lens) {
-+    sum += len;
-+  }
-+  if (sum != ciphertext.size()) {
-+    return false;  // framing mismatch — hard integrity check
-+  }
-+
-+  size_t pos = 0;
-+  for (uint32_t len : chunk_lens) {
-+    std::vector<uint8_t> chunk(ciphertext.begin() + pos,
-+                               ciphertext.begin() + pos + len);
-+    std::vector<uint8_t> part;
-+    if (!DecryptChunk(key, chunk, &part)) {
-+      out_plaintext->clear();
-+      return false;
-+    }
-+    out_plaintext->insert(out_plaintext->end(), part.begin(), part.end());
-+    pos += len;
-+  }
-+  return true;
 +}
 +
 +}  // namespace net::dig

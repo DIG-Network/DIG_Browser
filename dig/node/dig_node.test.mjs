@@ -139,11 +139,20 @@ test("page: every primary control/input carries a stable testid", () => {
     "node-token-input", "node-token-apply",
     "node-stats", "node-status-raw-toggle",
     "node-pin-input", "node-pin", "node-stores-refresh", "node-stores-list",
-    "node-cache-stats", "node-cap-input", "node-cap-apply", "node-cache-clear",
     "node-sync-stats", "node-upstream-input", "node-upstream-apply", "node-op-note",
   ]) {
     assert.match(html, new RegExp(`data-testid="${t}"`), `data-testid=${t}`);
   }
+});
+
+test("page: the node CACHE-config card is removed (#44 SoC — browser is not the cache UI)", () => {
+  // The browser does not surface node cache configuration. None of the cache
+  // controls, their testids, or the cache.* control calls remain in the page.
+  for (const t of ["node-cache-stats", "node-cap-input", "node-cap-apply", "node-cache-clear"]) {
+    assert.ok(!html.includes(`data-testid="${t}"`), `cache testid ${t} removed`);
+  }
+  assert.ok(!/control\.cache\./.test(html), "no control.cache.* calls in the page");
+  assert.ok(!/aria-label="Local cache"/.test(html), "no 'Local cache' card");
 });
 
 test("page: ARIA landmarks + live regions exist", () => {
