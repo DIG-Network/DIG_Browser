@@ -197,10 +197,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.resolve-release-context.outputs.target_tag }}
+          name: DIG Browser ${{ needs.resolve-release-context.outputs.target_tag }}
           fail_on_unmatched_files: true
           overwrite_files: true
           files: |
-            artifacts/**/ungoogled-chromium*
+            artifacts/**/dig-browser_*
 
   publish-winget:
     needs:
