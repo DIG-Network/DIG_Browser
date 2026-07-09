@@ -45,7 +45,7 @@ function extractFn(name) {
 const constsSrc = `
   var CONTROL_TOKEN_HEADER = 'X-Dig-Control-Token';
   var CONTROL_TOKEN_PARAM = '_control_token';
-  var CONTROL_ERR = {UNAUTHORIZED:-32020, NOT_SUPPORTED:-32021, CONTROL_ERROR:-32022};
+  var CONTROL_ERR = {UNAUTHORIZED:-32030, NOT_SUPPORTED:-32031, CONTROL_ERROR:-32032};
   var _rpcId = 0;
 `;
 const src =
@@ -92,16 +92,16 @@ test("page isLocalDigNode matches the module (status:ok + mode:local-node)", () 
 test("page classifyControlResponse maps the catalogued error codes like the module", () => {
   for (const r of [
     { result: { running: true } },
-    { error: { code: -32020, message: "x", data: { code: "UNAUTHORIZED" } } },
-    { error: { code: -32021, message: "x" } },
-    { error: { code: -32022, message: "x" } },
+    { error: { code: -32030, message: "x", data: { code: "UNAUTHORIZED" } } },
+    { error: { code: -32031, message: "x" } },
+    { error: { code: -32032, message: "x" } },
     { error: { code: -32601, message: "x" } },
     "not json", null,
   ]) {
     assert.equal(page.classifyControlResponse(r).kind, mod.classifyControlResponse(r).kind,
                  `kind for ${JSON.stringify(r)}`);
   }
-  assert.equal(page.classifyControlResponse({ error: { code: -32020, message: "x" } }).kind,
+  assert.equal(page.classifyControlResponse({ error: { code: -32030, message: "x" } }).kind,
                "unauthorized");
 });
 
@@ -296,7 +296,8 @@ test("page deploy: spend parse + error classification match the module (broadcas
   const signed = { status: "signed", success: true, spendBundle: { coinSpends: 3, aggregatedSignature: "ab" }, storeId: "0x" + "aa".repeat(32) };
   assert.deepEqual(depPage.parseSpendResult(signed), dep.parseSpendResult(signed));
   assert.equal(depPage.parseSpendResult(signed).broadcasted, false, "signed = not pushed");
-  for (const e of [{ code: 4001 }, { code: 4100 }, { code: 4900 },
+  for (const e of [{ code: 4001 }, { code: 4002 }, { code: 4003 }, { code: 4004 },
+                   { code: 4005 }, { code: 4900 },
                    { message: "not enough DIG" }, { message: "non-fast-forward" }]) {
     assert.equal(depPage.classifyWalletError(e), dep.classifyWalletError(e), JSON.stringify(e));
   }

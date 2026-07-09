@@ -316,11 +316,15 @@ test("parseSpendResult: an error body classifies to a DEPLOY_ERR code", () => {
 
 // ---- wallet error classification -------------------------------------------
 
-test("classifyWalletError: provider numeric codes map to DEPLOY_ERR", () => {
-  assert.equal(classifyWalletError({ code: 4001 }), DEPLOY_ERR.WALLET_DECLINED);
-  assert.equal(classifyWalletError({ code: 4100 }), DEPLOY_ERR.WALLET_UNAUTHORIZED);
-  assert.equal(classifyWalletError({ code: 4200 }), DEPLOY_ERR.WALLET_UNAUTHORIZED);
-  assert.equal(classifyWalletError({ code: 4900 }), DEPLOY_ERR.WALLET_UNREACHABLE);
+test("classifyWalletError: provider numeric codes map to DEPLOY_ERR (CHIP-0002 taxonomy)", () => {
+  // chia-provider v0.2.0 CHIP-0002 codes (#138/#119) — regression guard against
+  // the pre-bump taxonomy (was 4001=rejected/4100=unauthorized/4200=unsupported).
+  assert.equal(classifyWalletError({ code: 4002 }), DEPLOY_ERR.WALLET_DECLINED); // user rejected
+  assert.equal(classifyWalletError({ code: 4001 }), DEPLOY_ERR.WALLET_UNAUTHORIZED); // unauthorized
+  assert.equal(classifyWalletError({ code: 4004 }), DEPLOY_ERR.WALLET_UNAUTHORIZED); // method not found
+  assert.equal(classifyWalletError({ code: 4005 }), DEPLOY_ERR.WALLET_UNAUTHORIZED); // no secret key
+  assert.equal(classifyWalletError({ code: 4003 }), DEPLOY_ERR.INSUFFICIENT_DIG); // balance exceeded
+  assert.equal(classifyWalletError({ code: 4900 }), DEPLOY_ERR.WALLET_UNREACHABLE); // bridge down
 });
 
 test("classifyWalletError: on-chain conditions from the message text", () => {

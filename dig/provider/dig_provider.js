@@ -87,20 +87,29 @@
   var WALLET_CHAIN_ID = "mainnet";
   var PROVIDER_INFO = Object.freeze({
     isDIG: true,
-    /** 'walletconnect' (extension brokers to Sage) — the native browser reports 'in-process'. */
-    transport: "walletconnect",
+    /** 'injected' — the provider is injected in-page and served by the extension's own
+     *  self-custody wallet (there is no WalletConnect); the native browser reports 'native'. */
+    transport: "injected",
     /** 'extension' here; the native fork reports 'browser'. */
     edition: "extension",
     providerVersion: WALLET_PROVIDER_VERSION
   });
   var PROVIDER_ERROR_CODES = Object.freeze({
-    /** 4001 — the user rejected the request (or a connect is still pending approval). */
-    USER_REJECTED: 4001,
-    /** 4100 — the origin/account is not authorized (call connect() first). */
-    UNAUTHORIZED: 4100,
-    /** 4200 — the wallet does not support the requested method. */
-    UNSUPPORTED_METHOD: 4200,
-    /** 4900 — the wallet is disconnected / unreachable (no Sage session, relay down). */
+    /** 4000 — invalid method params. */
+    INVALID_PARAMS: 4e3,
+    /** 4001 — the origin/account is not authorized (call connect() first). */
+    UNAUTHORIZED: 4001,
+    /** 4002 — the user rejected the request (or a connect approval timed out). */
+    USER_REJECTED: 4002,
+    /** 4003 — the requested spend exceeds the spendable balance. */
+    SPENDABLE_BALANCE_EXCEEDED: 4003,
+    /** 4004 — the wallet does not support / cannot find the requested method. */
+    METHOD_NOT_FOUND: 4004,
+    /** 4005 — the wallet does not own a required secret key. */
+    NO_SECRET_KEY: 4005,
+    /** 4029 — too many requests (rate limited). */
+    LIMIT_EXCEEDED: 4029,
+    /** 4900 — the wallet is disconnected / not connected (Goby convention). */
     DISCONNECTED: 4900
   });
   function mapEnvelopeToError(env) {
@@ -120,8 +129,10 @@
       return e2;
     }
     let code;
-    if (status === 401 || status === 403) code = PROVIDER_ERROR_CODES.UNAUTHORIZED;
-    else if (status === 404) code = PROVIDER_ERROR_CODES.UNSUPPORTED_METHOD;
+    if (status === 400) code = PROVIDER_ERROR_CODES.INVALID_PARAMS;
+    else if (status === 401 || status === 403) code = PROVIDER_ERROR_CODES.UNAUTHORIZED;
+    else if (status === 404) code = PROVIDER_ERROR_CODES.METHOD_NOT_FOUND;
+    else if (status === 429) code = PROVIDER_ERROR_CODES.LIMIT_EXCEEDED;
     else if (status >= 500 || status === 0) code = PROVIDER_ERROR_CODES.DISCONNECTED;
     else code = PROVIDER_ERROR_CODES.USER_REJECTED;
     const e = new Error(msg);
@@ -150,15 +161,21 @@
       }
       return (env.body || {}).data;
     }
-    async function connect(eager) {
+    async function connect(opts) {
+      const eager = typeof opts === "boolean" ? opts : !!(opts && opts.eager);
+      const scope = opts && typeof opts === "object" ? opts.scope : void 0;
       const deadline = Date.now() + 12e4;
       for (; ; ) {
         try {
-          const r = await rpc("chip0002_connect", { eager: !!eager });
+          const params = { eager };
+          if (scope) params.scope = scope;
+          const r = await rpc("chip0002_connect", params);
           _connected = true;
           _chainId = WALLET_CHAIN_ID;
+          if (r && typeof r === "object" && r.address) _selectedAddress = r.address;
           fire("connect", r);
-          return r;
+          fire("accountChanged", _selectedAddress ? [_selectedAddress] : []);
+          return true;
         } catch (e) {
           if (e && e.pending && Date.now() < deadline) {
             await new Promise((res) => setTimeout(res, 1200));
@@ -193,12 +210,12 @@
       const target = params && params.chainId;
       if (target === WALLET_CHAIN_ID || target == null) return Promise.resolve(null);
       const e = new Error("DIG wallet supports only Chia mainnet");
-      e.code = PROVIDER_ERROR_CODES.UNSUPPORTED_METHOD;
+      e.code = PROVIDER_ERROR_CODES.METHOD_NOT_FOUND;
       return Promise.reject(e);
     }
     const provider = {
       isDIG: true,
-      // Goby identity flags — a Goby/Sage dApp feature-detects these (see loroco parity).
+      // Goby identity flags — a Goby/Sage dApp feature-detects these (Reference Wallet B parity).
       isGoby: true,
       name: WALLET_PROVIDER_NAME,
       apiVersion: WALLET_API_VERSION,
@@ -224,7 +241,7 @@
           return Promise.resolve(WALLET_METHODS);
         }
         if (method === "connect" || method === "chip0002_connect") {
-          return connect(params && params.eager);
+          return connect(params);
         }
         if (method === "requestAccounts") return requestAccounts();
         if (method === "accounts") return accounts();

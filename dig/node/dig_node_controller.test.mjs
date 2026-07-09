@@ -73,9 +73,20 @@ test("canonical control.* method names match the node surface (9 methods)", () =
 });
 
 test("catalogued control error codes match the dig-node contract", () => {
-  assert.equal(CONTROL_ERR.UNAUTHORIZED, -32020);
-  assert.equal(CONTROL_ERR.NOT_SUPPORTED, -32021);
-  assert.equal(CONTROL_ERR.CONTROL_ERROR, -32022);
+  assert.equal(CONTROL_ERR.UNAUTHORIZED, -32030);
+  assert.equal(CONTROL_ERR.NOT_SUPPORTED, -32031);
+  assert.equal(CONTROL_ERR.CONTROL_ERROR, -32032);
+});
+
+test("control error codes stay clear of the reserved onion-routing codes", () => {
+  // -32020/-32021/-32022 are RESERVED for onion (private-retrieval) failures
+  // (SPEC §2.6, dig-node meta.rs:407-441) — a renumber back into that range would
+  // make the browser misclassify a real onion failure as a control-plane one.
+  // Regression guard for #138 (the two ranges collided before this fix).
+  const onion = [-32020, -32021, -32022];
+  for (const code of Object.values(CONTROL_ERR)) {
+    assert.ok(!onion.includes(code), `${code} must not collide with an onion code`);
+  }
 });
 
 test("buildControlRequest: well-formed JSON-RPC with the token in params", () => {
@@ -132,16 +143,16 @@ test("classifyControlResponse: ok lifts the result", () => {
 
 test("classifyControlResponse: maps each catalogued error code to its kind", () => {
   const unauth = classifyControlResponse({
-    error: { code: -32020, message: "control token required",
+    error: { code: -32030, message: "control token required",
              data: { code: "UNAUTHORIZED", origin: "shell" } },
   });
   assert.equal(unauth.kind, "unauthorized");
-  assert.equal(unauth.code, -32020);
+  assert.equal(unauth.code, -32030);
   assert.equal(unauth.dataCode, "UNAUTHORIZED");
 
-  assert.equal(classifyControlResponse({ error: { code: -32021, message: "x" } }).kind,
+  assert.equal(classifyControlResponse({ error: { code: -32031, message: "x" } }).kind,
                "not-supported");
-  assert.equal(classifyControlResponse({ error: { code: -32022, message: "x" } }).kind,
+  assert.equal(classifyControlResponse({ error: { code: -32032, message: "x" } }).kind,
                "control-error");
   // any other JSON-RPC error → generic 'error'.
   assert.equal(classifyControlResponse({ error: { code: -32601, message: "no method" } }).kind,

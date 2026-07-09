@@ -64,15 +64,18 @@ export const CONTROL_METHODS = Object.freeze({
   syncTrigger: "control.sync.trigger",
 });
 
-// The catalogued control-plane JSON-RPC error codes (dig-node meta.rs:300-302).
+// The catalogued control-plane JSON-RPC error codes (dig-node meta.rs:407-441).
 // UNAUTHORIZED: missing/blank/wrong control token. NOT_SUPPORTED: the operation
 // is unavailable on this build (e.g. no §21 identity). CONTROL_ERROR: it failed
 // at runtime. Stable so the UI can react precisely (re-auth vs explain vs show
 // the message) without scraping prose.
+// CANONICAL control-plane numbers are -32030/-32031/-32032 (dig-rpc-types §10) —
+// CLEAR of -32020/-32021/-32022, which are RESERVED for the onion-routing (private
+// retrieval) contract (SPEC §2.6). Do NOT renumber back into the onion range.
 export const CONTROL_ERR = Object.freeze({
-  UNAUTHORIZED: -32020,
-  NOT_SUPPORTED: -32021,
-  CONTROL_ERROR: -32022,
+  UNAUTHORIZED: -32030,
+  NOT_SUPPORTED: -32031,
+  CONTROL_ERROR: -32032,
 });
 
 let _rpcId = 0;

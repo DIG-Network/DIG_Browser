@@ -471,19 +471,22 @@ export function parseSpendResult(result) {
 
 /**
  * Map a wallet error (a thrown provider error OR an error result body) to a
- * catalogued DEPLOY_ERR code. Branches on the provider's stable numeric `code`
- * (4001/4100/4200/4900) and on substrings of the message for the on-chain
- * conditions the wallet reports as text (insufficient DIG, non-fast-forward).
+ * catalogued DEPLOY_ERR code. Branches on the provider's stable numeric `code` —
+ * the CHIP-0002 taxonomy (chia-provider v0.2.0, #138/#119): 4001/4002/4003/4004/
+ * 4005/4900 — and on substrings of the message for the on-chain conditions the
+ * wallet reports as text (insufficient DIG, non-fast-forward).
  *
  * @param {object} err a thrown {code,message} OR an error result {error,…}.
  * @returns {string} a DEPLOY_ERR value.
  */
 export function classifyWalletError(err) {
   const e = err || {};
-  // 1) the provider's stable numeric codes (dig_provider.js ERROR_CODES).
-  if (e.code === 4001) return DEPLOY_ERR.WALLET_DECLINED; // user rejected / pending
-  if (e.code === 4100) return DEPLOY_ERR.WALLET_UNAUTHORIZED; // origin/session can't sign
-  if (e.code === 4200) return DEPLOY_ERR.WALLET_UNAUTHORIZED; // unsupported → can't perform
+  // 1) the provider's stable numeric codes (@dignetwork/chia-provider PROVIDER_ERROR_CODES).
+  if (e.code === 4002) return DEPLOY_ERR.WALLET_DECLINED; // user rejected / pending
+  if (e.code === 4001) return DEPLOY_ERR.WALLET_UNAUTHORIZED; // origin/session can't sign
+  if (e.code === 4004) return DEPLOY_ERR.WALLET_UNAUTHORIZED; // unsupported → can't perform
+  if (e.code === 4005) return DEPLOY_ERR.WALLET_UNAUTHORIZED; // no secret key → can't sign
+  if (e.code === 4003) return DEPLOY_ERR.INSUFFICIENT_DIG; // spendable balance exceeded
   if (e.code === 4900) return DEPLOY_ERR.WALLET_UNREACHABLE; // bridge down
   // 2) on-chain conditions the wallet reports in the message text.
   const msg = String(e.message || e.error || "").toLowerCase();

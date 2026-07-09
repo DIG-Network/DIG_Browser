@@ -15,10 +15,12 @@
 //   - identity: isDIG, isGoby, version, info{transport:native,edition:browser,scheme:chia}
 //   - the static method catalogue (window.chia.methods, all namespaced, no dups)
 //   - request({method:'chip0002_getMethods'|'getMethods'}) answered locally (no bridge)
-//   - the shared error codes (USER_REJECTED/UNAUTHORIZED/UNSUPPORTED_METHOD/DISCONNECTED)
-//   - transport error mapping: unreachable→4900, 401→4100, 202→4001+pending
+//   - the shared CHIP-0002 error codes (INVALID_PARAMS/UNAUTHORIZED/USER_REJECTED/
+//     SPENDABLE_BALANCE_EXCEEDED/METHOD_NOT_FOUND/NO_SECRET_KEY/LIMIT_EXCEEDED/DISCONNECTED)
+//   - transport error mapping: unreachable→4900, 401→4001, 202→4002+pending
 //   - Goby parity: isConnected() callable, direct methods, transfer→chia_send remap,
-//     requestAccounts/accounts, walletSwitchChain mainnet-only, the 202→200 retry loop
+//     requestAccounts/accounts, walletSwitchChain mainnet-only, the 202→200 retry loop,
+//     connect() resolving a BOOLEAN (chia-provider v0.2.0, #138/#119)
 //
 // Run:  node --test dig/provider/dig_provider.test.mjs
 // (Node >= 18; uses the built-in `node:test` runner + `node:assert`.)
@@ -126,13 +128,19 @@ test('chip0002_getMethods is answered locally (no bridge call) and returns the c
   assert.equal(bridgeCalls, 0, 'introspection must not hit the native bridge');
 });
 
-test('errorCodes catalogue is exported and uses the shared package codes', () => {
+test('errorCodes catalogue is exported and uses the shared CHIP-0002 package codes', () => {
   const { chia } = loadProvider();
   assert.ok(chia.errorCodes && typeof chia.errorCodes === 'object');
-  assert.equal(chia.errorCodes.USER_REJECTED, 4001);
-  assert.equal(chia.errorCodes.UNAUTHORIZED, 4100);
-  assert.equal(chia.errorCodes.UNSUPPORTED_METHOD, 4200);
-  // Shared-package name is DISCONNECTED (was WALLET_UNREACHABLE in the old fork).
+  // CHIP-0002 numbers (chia-provider v0.2.0, #138/#119): 4000 invalid params ·
+  // 4001 unauthorized · 4002 user-rejected · 4003 spendable-balance exceeded ·
+  // 4004 method-not-found · 4005 no-secret-key · 4029 rate-limited · 4900 disconnected.
+  assert.equal(chia.errorCodes.INVALID_PARAMS, 4000);
+  assert.equal(chia.errorCodes.UNAUTHORIZED, 4001);
+  assert.equal(chia.errorCodes.USER_REJECTED, 4002);
+  assert.equal(chia.errorCodes.SPENDABLE_BALANCE_EXCEEDED, 4003);
+  assert.equal(chia.errorCodes.METHOD_NOT_FOUND, 4004);
+  assert.equal(chia.errorCodes.NO_SECRET_KEY, 4005);
+  assert.equal(chia.errorCodes.LIMIT_EXCEEDED, 4029);
   assert.equal(chia.errorCodes.DISCONNECTED, 4900);
 });
 
@@ -144,7 +152,7 @@ test('an unreachable bridge throws DISCONNECTED (4900), not the ad-hoc -1', asyn
     (e) => { assert.equal(e.code, 4900); return true; });
 });
 
-test('a 401 from the wallet maps to UNAUTHORIZED (4100)', async () => {
+test('a 401 from the wallet maps to UNAUTHORIZED (4001)', async () => {
   const bridge = {
     request(_req, cb) {
       cb(JSON.stringify({ status: 401, body: { error: 'origin not approved' } }));
@@ -153,18 +161,18 @@ test('a 401 from the wallet maps to UNAUTHORIZED (4100)', async () => {
   const { chia } = loadProvider(bridge);
   await assert.rejects(
     () => chia.request({ method: 'getPublicKeys' }),
-    (e) => { assert.equal(e.code, 4100); return true; });
+    (e) => { assert.equal(e.code, 4001); return true; });
 });
 
-test('a pending (202) surfaces USER_REJECTED-class pending code (4001)', async () => {
+test('a pending (202) surfaces USER_REJECTED-class pending code (4002)', async () => {
   const bridge = {
     request(_req, cb) { cb(JSON.stringify({ status: 202, body: {} })); },
   };
   const { chia } = loadProvider(bridge);
-  // rpc() (not connect()'s retry loop) throws the pending error with code 4001.
+  // rpc() (not connect()'s retry loop) throws the pending error with code 4002.
   await assert.rejects(
     () => chia.request({ method: 'getPublicKeys' }),
-    (e) => { assert.equal(e.code, 4001); assert.equal(e.pending, true); return true; });
+    (e) => { assert.equal(e.code, 4002); assert.equal(e.pending, true); return true; });
 });
 
 test('a successful call returns body.data and isConnected() flips true on connect', async () => {
@@ -256,7 +264,7 @@ test('walletSwitchChain accepts mainnet locally and rejects other chains as unsu
   assert.equal(reqs.length, 0, 'mainnet switch is answered locally, no bridge call');
   await assert.rejects(
     () => chia.walletSwitchChain({ chainId: 'testnet11' }),
-    (e) => { assert.equal(e.code, 4200); return true; });
+    (e) => { assert.equal(e.code, 4004); return true; });
 });
 
 test('connect() polls through 202 pending-approval responses then resolves', async () => {
@@ -275,7 +283,9 @@ test('connect() polls through 202 pending-approval responses then resolves', asy
     };
     const { chia } = loadProvider(bridge);
     const r = await chia.connect();
-    sameJson(r, { approved: true });
+    // CHIP-0002 connect() resolves a BOOLEAN (chia-provider v0.2.0, #138/#119) —
+    // not the raw wallet result — regardless of what the bridge's final rpc call returned.
+    assert.equal(r, true);
     assert.equal(attempt, 3, 'should have retried twice before approval');
     assert.equal(chia.isConnected(), true);
   } finally {

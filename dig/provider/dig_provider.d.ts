@@ -51,29 +51,37 @@ export type ChiaMethod =
 export type WalletMethod = Chip0002Method | ChiaMethod;
 
 /**
- * Stable, documented thrown-error codes (EIP-1193 / CHIP-0002 aligned). These are
- * the shared @dignetwork/chia-provider codes — identical across the browser and
- * the extension.
+ * Stable, documented thrown-error codes — the **CHIP-0002** set (chia-provider
+ * v0.2.0, #138/#119). These are the shared @dignetwork/chia-provider codes —
+ * identical across the browser and the extension.
  */
 export interface DigProviderErrorCodes {
-  /** 4001 — the user rejected the request / a connect is still pending approval. */
-  USER_REJECTED: 4001;
-  /** 4100 — origin not approved, or the wallet can't sign (watch-only/expired). */
-  UNAUTHORIZED: 4100;
-  /** 4200 — the wallet does not support the requested method (or chain). */
-  UNSUPPORTED_METHOD: 4200;
+  /** 4000 — invalid method params. */
+  INVALID_PARAMS: 4000;
+  /** 4001 — the origin/account is not authorized (call connect() first). */
+  UNAUTHORIZED: 4001;
+  /** 4002 — the user rejected the request, or a connect is still pending approval. */
+  USER_REJECTED: 4002;
+  /** 4003 — the requested spend exceeds the spendable balance. */
+  SPENDABLE_BALANCE_EXCEEDED: 4003;
+  /** 4004 — the wallet does not support / cannot find the requested method (or chain). */
+  METHOD_NOT_FOUND: 4004;
+  /** 4005 — the wallet does not own a required secret key. */
+  NO_SECRET_KEY: 4005;
+  /** 4029 — too many requests (rate limited). */
+  LIMIT_EXCEEDED: 4029;
   /** 4900 — the wallet bridge is disconnected / unreachable / malformed. */
   DISCONNECTED: 4900;
 }
 
 /** The numeric error code carried on a thrown {@link DigProviderError}. */
-export type DigProviderErrorCode = 4001 | 4100 | 4200 | 4900;
+export type DigProviderErrorCode = 4000 | 4001 | 4002 | 4003 | 4004 | 4005 | 4029 | 4900;
 
 /** Error thrown by `request()`/`connect()`/direct methods. `code` is stable; branch on it. */
 export interface DigProviderError extends Error {
   /** Stable machine code from {@link DigProviderErrorCodes}. */
   code: DigProviderErrorCode;
-  /** True when a connect is pending the user's per-origin approval (code 4001). */
+  /** True when a connect is pending the user's per-origin approval (code 4002). */
   pending?: boolean;
   /** The raw wallet transport status (HTTP-like), when one was returned. */
   status?: number;
@@ -142,12 +150,13 @@ export interface DigChiaProvider {
   request<T = unknown>(args: DigRequestArgs): Promise<T>;
 
   /**
-   * Request per-origin approval. Resolves once the user approves (or with an eager
-   * session); polls through pending approval; rejects with a {@link DigProviderError}
-   * on reject/timeout.
+   * Request per-origin approval. Resolves `true` once the user approves (or with an
+   * eager session) — a CHIP-0002/Goby boolean result, not the raw wallet payload;
+   * polls through pending approval; rejects with a {@link DigProviderError} on
+   * reject/timeout.
    */
-  connect(eager?: boolean): Promise<unknown>;
-  /** Switch chain. `"mainnet"` (or absent) resolves; any other chain rejects 4200. */
+  connect(eager?: boolean): Promise<boolean>;
+  /** Switch chain. `"mainnet"` (or absent) resolves; any other chain rejects 4004. */
   walletSwitchChain(params: { chainId: string }): Promise<null>;
   walletWatchAsset(params: unknown): Promise<unknown>;
   getPublicKeys(params?: unknown): Promise<unknown>;

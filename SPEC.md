@@ -130,12 +130,33 @@ page, never partial content.
 
 ## 6. Wallet — injected `window.chia`
 
-The browser injects a `window.chia` provider (built from `@dignetwork/chia-provider`, bundled by
-`dig/provider/build-provider.mjs`) exposing the CHIP-0002 method set (parity with the hub's shared
-`WALLET_METHODS`): `chip0002_{connect,chainId,getPublicKeys,getAssetCoins,getAssetBalance,
-signCoinSpends,signMessage}`, `chia_{getAddress,signMessageByAddress,takeOffer,createOffer,getNfts}`.
-Requests are answered by the in-browser wallet over a loopback bridge behind a per-origin consent
-gate; the wallet holds the keys and signs — dapps and the content loader never see key material.
+The browser injects a `window.chia` provider (built from `@dignetwork/chia-provider` v0.2.0 — a
+git-dependency pin on the `v0.2.0` tag, since npm publish is blocked ecosystem-wide, tracked
+separately — bundled by `dig/provider/build-provider.mjs`) exposing the CHIP-0002 method set
+(parity with the hub's shared `WALLET_METHODS`): `chip0002_{connect,chainId,getPublicKeys,
+getAssetCoins,getAssetBalance,signCoinSpends,signMessage}`,
+`chia_{getAddress,signMessageByAddress,takeOffer,createOffer,getNfts}`. Requests are answered by
+the in-browser wallet over a loopback bridge behind a per-origin consent gate; the wallet holds
+the keys and signs — dapps and the content loader never see key material.
+
+`connect()` resolves a **boolean** (`true` on approval) per the CHIP-0002/Goby contract, not the
+raw wallet payload. Thrown errors carry a stable numeric `code` from the shared package's CHIP-0002
+taxonomy — identical across the DIG Browser and the `dig-chrome-extension`:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 4000 | `INVALID_PARAMS` | invalid method params |
+| 4001 | `UNAUTHORIZED` | origin/account not authorized — call `connect()` first |
+| 4002 | `USER_REJECTED` | the user rejected the request, or a connect is still pending approval (`pending: true`) |
+| 4003 | `SPENDABLE_BALANCE_EXCEEDED` | the requested spend exceeds the spendable balance |
+| 4004 | `METHOD_NOT_FOUND` | the wallet does not support/cannot find the method (or chain) |
+| 4005 | `NO_SECRET_KEY` | the wallet lacks a required secret key |
+| 4029 | `LIMIT_EXCEEDED` | rate-limited |
+| 4900 | `DISCONNECTED` | the wallet bridge is unreachable/disconnected |
+
+A dApp/agent MUST branch on these numeric codes, not on message text. (Prior to the v0.2.0 bump
+the browser carried an ad-hoc 4001/4100/4200/4900 scheme that disagreed with the extension's
+CHIP-0002 numbers on 4001 — fixed; both providers now share one taxonomy.)
 
 ## 7. Shields — per-resource proof provenance
 
@@ -152,6 +173,25 @@ weakens them.
 source, wallet/connection state, links). The browser MAY link out to the external node's own control
 surface (`dig://control` content served by the node) but is NOT the node's configuration UI — node
 configuration lives with the node.
+
+### 8.1 `dig://node` — My Node controller
+
+When a local standalone dig-node is present, `dig://node` (`dig/node/dig_node_controller.mjs`, DOM
+copy `dig/node/dig_node.html`) drives its `control.*` admin RPCs (status, hosted-stores list/pin/
+unpin, §21 sync status/trigger, config get/set-upstream) over the node's loopback control endpoint,
+authorized by the node-issued local control token (`X-Dig-Control-Token` header /
+`_control_token` param). The catalogued control-plane JSON-RPC error codes are:
+
+| Code | Name | Meaning |
+|------|------|---------|
+| -32030 | `UNAUTHORIZED` | missing/blank/wrong control token |
+| -32031 | `NOT_SUPPORTED` | the operation is unavailable on this build (e.g. no §21 identity) |
+| -32032 | `CONTROL_ERROR` | the operation failed at runtime |
+
+These numbers are **canonical and CLEAR of `-32020`/`-32021`/`-32022`**, which are RESERVED for the
+onion-routing (private-retrieval) failure codes — the two ranges must never collide, or the browser
+could misclassify a real onion failure as a control-plane one (or vice versa). Byte-identical to the
+dig-node contract (`dig-node-core/src/lib.rs`, `dig-node-service/src/meta.rs`).
 
 ## 9. Conformance
 

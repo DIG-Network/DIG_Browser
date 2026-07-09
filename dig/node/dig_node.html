@@ -427,8 +427,9 @@
     // local-token auth (dig-node control.rs / meta.rs x-control-auth).
     var CONTROL_TOKEN_HEADER = 'X-Dig-Control-Token';
     var CONTROL_TOKEN_PARAM = '_control_token';
-    // catalogued control-plane error codes (dig-node meta.rs).
-    var CONTROL_ERR = {UNAUTHORIZED:-32020, NOT_SUPPORTED:-32021, CONTROL_ERROR:-32022};
+    // catalogued control-plane error codes (dig-node meta.rs:407-441). Canonical
+    // -32030/-32031/-32032 — clear of -32020/-32021/-32022, RESERVED for onion.
+    var CONTROL_ERR = {UNAUTHORIZED:-32030, NOT_SUPPORTED:-32031, CONTROL_ERROR:-32032};
     // canonical control.* method names (dig-node meta.rs:157-237).
     var CONTROL_METHODS = {
       status:'control.status',
@@ -645,9 +646,11 @@
 
     function classifyWalletError(err){
       var e = err || {};
-      if (e.code === 4001) return DEPLOY_ERR.WALLET_DECLINED;
-      if (e.code === 4100) return DEPLOY_ERR.WALLET_UNAUTHORIZED;
-      if (e.code === 4200) return DEPLOY_ERR.WALLET_UNAUTHORIZED;
+      if (e.code === 4002) return DEPLOY_ERR.WALLET_DECLINED;
+      if (e.code === 4001) return DEPLOY_ERR.WALLET_UNAUTHORIZED;
+      if (e.code === 4004) return DEPLOY_ERR.WALLET_UNAUTHORIZED;
+      if (e.code === 4005) return DEPLOY_ERR.WALLET_UNAUTHORIZED;
+      if (e.code === 4003) return DEPLOY_ERR.INSUFFICIENT_DIG;
       if (e.code === 4900) return DEPLOY_ERR.WALLET_UNREACHABLE;
       var msg = String(e.message || e.error || '').toLowerCase();
       if (/insufficient|not enough|over[_ ]?quota|over the (dig|store)/.test(msg)) return DEPLOY_ERR.INSUFFICIENT_DIG;
